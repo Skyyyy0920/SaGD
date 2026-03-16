@@ -1,0 +1,35 @@
+# Model
+teacher_model: "Qwen/Qwen3-8B"
+student_model: "Qwen/Qwen3-0.6B"
+
+# Data
+data_source: "databricks/databricks-dolly-15k"
+max_seq_len: 512
+dataset_seed: 42
+
+# Training
+epochs: 3
+batch_size: 8
+gradient_accumulation: 4
+lr: 2.0e-5
+weight_decay: 0.01
+warmup_ratio: 0.03
+max_grad_norm: 1.0
+temperature: 2.0
+fp16: true
+
+# SaGD
+teacher_saliency_path: "data/teacher_saliency.pt"
+lambda_sal: 0.5
+sagd_every_n_steps: 5
+sagd_tau_w: 1.0
+saliency_temperature: 2.0
+
+# Evaluation
+eval_samples: 500
+max_new_tokens: 256
+eval_batch_size: 8
+
+# Logging
+log_every: 50
+save_every_n_epochs: 1

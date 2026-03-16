@@ -1,0 +1,29 @@
+[project]
+name = "sagd"
+version = "0.1.0"
+description = "Saliency-Guided Knowledge Distillation"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.45",
+    "accelerate>=0.27",
+    "datasets>=2.16",
+    "rouge-score>=0.1.2",
+    "tqdm>=4.66",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+eval = ["lm-eval>=0.4"]
+dev = ["pytest>=7.4", "pytest-timeout>=2.2"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 120

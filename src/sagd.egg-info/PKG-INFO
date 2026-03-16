@@ -1,0 +1,19 @@
+Metadata-Version: 2.4
+Name: sagd
+Version: 0.1.0
+Summary: Saliency-Guided Knowledge Distillation
+Requires-Python: >=3.10
+License-File: LICENSE
+Requires-Dist: torch>=2.1
+Requires-Dist: transformers>=4.45
+Requires-Dist: accelerate>=0.27
+Requires-Dist: datasets>=2.16
+Requires-Dist: rouge-score>=0.1.2
+Requires-Dist: tqdm>=4.66
+Requires-Dist: pyyaml>=6.0
+Provides-Extra: eval
+Requires-Dist: lm-eval>=0.4; extra == "eval"
+Provides-Extra: dev
+Requires-Dist: pytest>=7.4; extra == "dev"
+Requires-Dist: pytest-timeout>=2.2; extra == "dev"
+Dynamic: license-file

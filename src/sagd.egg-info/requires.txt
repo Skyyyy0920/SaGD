@@ -1,0 +1,14 @@
+torch>=2.1
+transformers>=4.45
+accelerate>=0.27
+datasets>=2.16
+rouge-score>=0.1.2
+tqdm>=4.66
+pyyaml>=6.0
+
+[dev]
+pytest>=7.4
+pytest-timeout>=2.2
+
+[eval]
+lm-eval>=0.4

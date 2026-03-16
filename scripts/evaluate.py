@@ -26,6 +26,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_samples", type=int, default=500)
     p.add_argument("--max_new_tokens", type=int, default=256)
     p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--subset", type=str, default="test",
+                    choices=["train", "val", "test"])
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--output_path", type=str, default=None)
     p.add_argument("--seed", type=int, default=42)
@@ -49,6 +51,7 @@ def main() -> None:
         max_seq_len=args.max_seq_len,
         max_samples=args.max_samples,
         seed=args.seed,
+        subset=args.subset,
     )
 
     metrics = evaluate_rouge(

@@ -25,6 +25,7 @@ class SaliencyComputer:
         self.temperature = temperature
         self.eps = eps
 
+    @torch.enable_grad()
     def compute(
         self,
         model: nn.Module,
@@ -32,13 +33,16 @@ class SaliencyComputer:
         attention_mask: torch.Tensor,  # (B, L)
         labels_mask: torch.Tensor,     # (B, L)
     ) -> torch.Tensor:
-        """Compute raw saliency. Response and padding positions are zeroed.
+        """Non-differentiable saliency. Used for:
+        - Teacher saliency precomputation
+        - Saliency diagnosis
+        - Reweighting signal (JSD) computation in training
 
         CRITICAL: temporarily disables model param grads (§5.1).
         CRITICAL: masks with attention_mask, not just labels_mask (§5.2).
 
         Returns:
-            saliency: (B, L) — raw saliency, pre-masked.
+            saliency: (B, L) — raw saliency, pre-masked, detached.
         """
         # Save and disable all param grads to prevent pollution
         param_states = {n: p.requires_grad for n, p in model.named_parameters()}
@@ -84,6 +88,65 @@ class SaliencyComputer:
                 p.requires_grad_(param_states[n])
 
         return saliency.detach()  # (B, L)
+
+    @torch.enable_grad()
+    def compute_differentiable(
+        self,
+        model: nn.Module,
+        input_ids: torch.Tensor,      # (B, L)
+        attention_mask: torch.Tensor,  # (B, L)
+        labels_mask: torch.Tensor,     # (B, L)
+    ) -> torch.Tensor:
+        """Differentiable saliency for saliency alignment loss.
+
+        Uses torch.autograd.grad with create_graph=True so that
+        sal_loss.backward() propagates second-order gradients to model parameters.
+
+        ONLY used for student saliency in the saliency alignment loss path.
+        NOT used for reweighting (reweighting uses non-differentiable compute()).
+
+        Returns:
+            saliency: (B, L) — differentiable, gradients flow to model parameters.
+        """
+        # 1. Embed: DO NOT detach — must stay in the computation graph
+        embed = model.get_input_embeddings()(input_ids)  # (B, L, d)
+        embed.retain_grad()  # need grad on this intermediate tensor
+
+        # 2. Forward through the full model
+        outputs = model(inputs_embeds=embed, attention_mask=attention_mask)
+        logits = outputs.logits  # (B, L, V)
+
+        # 3. Response log-prob with shift alignment
+        shifted_logits = logits[:, :-1, :]        # (B, L-1, V)
+        shifted_targets = input_ids[:, 1:]         # (B, L-1)
+        shifted_mask = labels_mask[:, 1:].float()  # (B, L-1)
+
+        log_probs = F.log_softmax(shifted_logits, dim=-1)  # (B, L-1, V)
+        token_log_probs = log_probs.gather(
+            dim=-1, index=shifted_targets.unsqueeze(-1)
+        ).squeeze(-1)  # (B, L-1)
+
+        response_ll = (token_log_probs * shifted_mask).sum()  # scalar
+
+        # 4. Grad with create_graph=True — this is the key difference
+        if response_ll.abs().item() < 1e-9:
+            return torch.zeros(
+                input_ids.shape[0], input_ids.shape[1],
+                device=input_ids.device, requires_grad=True,
+            )
+
+        grad = torch.autograd.grad(
+            response_ll, embed, create_graph=True, retain_graph=True,
+        )[0]  # (B, L, d) — differentiable w.r.t. model parameters
+
+        # 5. Saliency: norm of gradient per position
+        saliency = grad.norm(dim=-1)  # (B, L) — differentiable!
+
+        # 6. Mask prompt positions (same logic as compute())
+        prompt_mask = (1 - labels_mask).float() * attention_mask.float()  # (B, L)
+        saliency = saliency * prompt_mask  # (B, L) — still differentiable
+
+        return saliency  # (B, L) — NOT detached, gradients flow to model params
 
     def to_distribution(
         self,

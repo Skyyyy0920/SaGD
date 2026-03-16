@@ -27,7 +27,7 @@ Phase 7   Exp 7: Benchmark 防御（MMLU 等）        1 GPU    ~2h     → Appe
 
 **目的**: Teacher 是冻结的，saliency 只需算一次，缓存到磁盘，后续所有实验复用。
 
-**关键**: 必须与训练使用完全相同的 data_source、seed、max_seq_len、tokenizer，否则 index→saliency 映射会静默错乱。
+**关键**: 必须与训练使用完全相同的 data_source、seed、max_seq_len、tokenizer、subset，否则 index→saliency 映射会静默错乱。预计算和训练都使用 subset="train"（默认值）。
 
 ```bash
 python scripts/precompute_teacher_saliency.py \
@@ -73,6 +73,7 @@ for SEED in 42 123 456; do
         --student_ckpt outputs/standard_kd/seed_${SEED}/student_final.pt \
         --teacher_saliency_path data/teacher_saliency.pt \
         --output_path outputs/standard_kd/seed_${SEED}/saliency_diagnosis.json \
+        --subset val \
         --max_samples 500 \
         --device cuda:0
 done
@@ -104,6 +105,7 @@ python scripts/diagnose_saliency.py \
     --student_ckpt outputs/pretrained_student.pt \
     --teacher_saliency_path data/teacher_saliency.pt \
     --output_path outputs/pretrained_saliency_diagnosis.json \
+    --subset val \
     --max_samples 500 \
     --device cuda:0
 ```
@@ -161,17 +163,19 @@ done
 ```bash
 for METHOD in standard_kd reverse_kl sagd; do
     for SEED in 42 123 456; do
-        # ROUGE-L
+        # ROUGE-L (on test subset)
         python scripts/evaluate.py \
             --student_ckpt outputs/${METHOD}/seed_${SEED}/student_final.pt \
             --output_path outputs/${METHOD}/seed_${SEED}/eval_metrics.json \
+            --subset test \
             --device cuda:0
 
-        # Saliency Loyalty (Mean JSD)
+        # Saliency Loyalty (Mean JSD, on val subset)
         python scripts/diagnose_saliency.py \
             --student_ckpt outputs/${METHOD}/seed_${SEED}/student_final.pt \
             --teacher_saliency_path data/teacher_saliency.pt \
             --output_path outputs/${METHOD}/seed_${SEED}/saliency_diagnosis.json \
+            --subset val \
             --device cuda:0
     done
 done
@@ -282,6 +286,7 @@ for CONFIG in sagd_loss_only sagd_reweight_only; do
         python scripts/evaluate.py \
             --student_ckpt outputs_ablation/${CONFIG}/sagd/seed_${SEED}/student_final.pt \
             --output_path outputs_ablation/${CONFIG}/sagd/seed_${SEED}/eval_metrics.json \
+            --subset test \
             --device cuda:0
     done
 done
@@ -291,6 +296,7 @@ for LAMBDA in 0.01 0.1 0.5 1.0 2.0; do
     python scripts/evaluate.py \
         --student_ckpt outputs_sweep/lambda_${LAMBDA}/sagd/seed_42/student_final.pt \
         --output_path outputs_sweep/lambda_${LAMBDA}/sagd/seed_42/eval_metrics.json \
+        --subset test \
         --device cuda:0
 done
 
@@ -340,6 +346,7 @@ for EPOCH in 1 2 3; do
         --student_ckpt outputs/sagd/seed_42/student_epoch${EPOCH}.pt \
         --teacher_saliency_path data/teacher_saliency.pt \
         --output_path outputs/sagd/seed_42/saliency_epoch${EPOCH}.json \
+        --subset val \
         --device cuda:0
 done
 
@@ -349,6 +356,7 @@ for EPOCH in 1 2 3; do
         --student_ckpt outputs/standard_kd/seed_42/student_epoch${EPOCH}.pt \
         --teacher_saliency_path data/teacher_saliency.pt \
         --output_path outputs/standard_kd/seed_42/saliency_epoch${EPOCH}.json \
+        --subset val \
         --device cuda:0
 done
 ```
@@ -404,6 +412,7 @@ for method in ['standard_kd', 'sagd']:
 ```bash
 python scripts/precompute_teacher_saliency.py \
     --model_name meta-llama/Llama-3.1-8B \
+    --tokenizer_name meta-llama/Llama-3.1-1B \
     --output_path data/teacher_saliency_llama.pt \
     --batch_size 4 \
     --max_seq_len 512 \
@@ -442,6 +451,7 @@ for METHOD in standard_kd sagd; do
             --student_model meta-llama/Llama-3.1-1B \
             --student_ckpt outputs_llama/${METHOD}/seed_${SEED}/student_final.pt \
             --output_path outputs_llama/${METHOD}/seed_${SEED}/eval_metrics.json \
+            --subset test \
             --device cuda:0
     done
 done

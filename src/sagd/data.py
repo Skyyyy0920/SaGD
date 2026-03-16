@@ -32,8 +32,10 @@ class InstructionDataset(Dataset):
         dataset_name: HF dataset name.
         max_seq_len: Maximum sequence length.
         max_samples: Limit number of samples (None = all).
-        split: Dataset split.
+        split: HuggingFace dataset split (default "train").
         seed: Random seed for shuffling.
+        subset: Which subset after shuffled split: "train", "val", or "test".
+            train = first N-1000, val = next 500, test = last 500.
     """
 
     def __init__(
@@ -44,12 +46,29 @@ class InstructionDataset(Dataset):
         max_samples: int | None = None,
         split: str = "train",
         seed: int = 42,
+        subset: str = "train",
     ) -> None:
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
 
         raw = load_dataset(dataset_name, split=split)
         raw = raw.shuffle(seed=seed)
+
+        # Split into train / val / test
+        n_total = len(raw)
+        n_test = 500
+        n_val = 500
+        n_train = n_total - n_test - n_val
+
+        if subset == "train":
+            raw = raw.select(range(n_train))
+        elif subset == "val":
+            raw = raw.select(range(n_train, n_train + n_val))
+        elif subset == "test":
+            raw = raw.select(range(n_train + n_val, n_total))
+        else:
+            raise ValueError(f"Unknown subset: {subset}. Must be train/val/test")
+
         if max_samples is not None:
             raw = raw.select(range(min(max_samples, len(raw))))
 

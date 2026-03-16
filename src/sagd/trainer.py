@@ -205,26 +205,31 @@ class Trainer:
                             t_logits, s_logits, labels_mask,
                         )  # (B,)
 
-                        # Compute student saliency (outside autocast for grad computation)
-                        with torch.amp.autocast("cuda", enabled=False):
-                            student_sal = self.saliency_computer.compute(
+                        # NON-differentiable student saliency — for reweighting only
+                        with torch.no_grad():
+                            student_sal_for_reweight = self.saliency_computer.compute(
                                 self.student, input_ids, attention_mask, labels_mask,
-                            )  # (B, L)
+                            )  # (B, L), detached
 
                         teacher_sal = self._get_cached_teacher_saliency(
                             indices, input_ids.size(1), input_ids.device,
                         )  # (B, L)
 
-                        sal_loss, sal_stats = self.sal_align_loss(
-                            teacher_sal, student_sal, labels_mask, attention_mask,
-                        )
-
+                        # Reweighting: uses NON-differentiable saliency
                         jsd = self.saliency_computer.divergence(
-                            teacher_sal, student_sal, labels_mask, attention_mask,
+                            teacher_sal, student_sal_for_reweight, labels_mask, attention_mask,
                         )  # (B,)
-
-                        # Reweighting: softmax(jsd / tau_w) * B → mean-normalized to 1
                         weights = F.softmax(jsd / self.sagd_tau_w, dim=0) * jsd.size(0)  # (B,)
+
+                        # DIFFERENTIABLE student saliency — for alignment loss
+                        with torch.amp.autocast("cuda", enabled=False):
+                            student_sal_for_loss = self.saliency_computer.compute_differentiable(
+                                self.student, input_ids, attention_mask, labels_mask,
+                            )  # (B, L), differentiable!
+
+                        sal_loss, sal_stats = self.sal_align_loss(
+                            teacher_sal, student_sal_for_loss, labels_mask, attention_mask,
+                        )
 
                         loss = (weights.detach() * per_sample_kl).mean() + \
                                self.lambda_sal * sal_loss

@@ -93,6 +93,7 @@ def main() -> None:
         max_seq_len=args.max_seq_len,
         max_samples=args.max_train_samples,
         seed=args.seed,
+        subset="train",
     )
     print(f"Dataset size: {len(dataset)}")
 
@@ -133,8 +134,8 @@ def main() -> None:
             dataset_name=args.data_source,
             max_seq_len=args.max_seq_len,
             max_samples=500,
-            split="train",  # Dolly only has train split
             seed=args.seed,
+            subset="test",
         )
         metrics = evaluate_rouge(
             student, s_tokenizer, eval_dataset,

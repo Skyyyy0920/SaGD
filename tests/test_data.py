@@ -77,3 +77,53 @@ class TestInstructionDataset:
         assert "category" in meta
         assert "instruction" in meta
         assert "response" in meta
+
+
+class TestSubsetSplits:
+    def test_subset_splits_cover_all_data(self, tiny_tokenizer):
+        """Train + val + test cover the full dataset without gaps."""
+        train_ds = InstructionDataset(
+            tokenizer=tiny_tokenizer, max_seq_len=32, subset="train",
+        )
+        val_ds = InstructionDataset(
+            tokenizer=tiny_tokenizer, max_seq_len=32, subset="val",
+        )
+        test_ds = InstructionDataset(
+            tokenizer=tiny_tokenizer, max_seq_len=32, subset="test",
+        )
+
+        # Sizes should add up to the full dataset
+        total = len(train_ds) + len(val_ds) + len(test_ds)
+        assert total == 15011, f"Expected 15011, got {total}"
+        assert len(train_ds) == 15011 - 500 - 500
+        assert len(val_ds) == 500
+        assert len(test_ds) == 500
+
+        # First sample of each subset should be different
+        # (since they come from different contiguous ranges)
+        train_first = train_ds.get_metadata(0)["instruction"]
+        val_first = val_ds.get_metadata(0)["instruction"]
+        test_first = test_ds.get_metadata(0)["instruction"]
+        # At least two of three should differ (extremely unlikely to collide)
+        assert not (train_first == val_first == test_first)
+
+    def test_subset_default_is_train(self, tiny_tokenizer):
+        """Default subset is train."""
+        ds = InstructionDataset(
+            tokenizer=tiny_tokenizer, max_seq_len=32, max_samples=10,
+        )
+        ds_train = InstructionDataset(
+            tokenizer=tiny_tokenizer, max_seq_len=32, max_samples=10, subset="train",
+        )
+        assert len(ds) == len(ds_train)
+
+    def test_val_and_test_have_500_samples(self, tiny_tokenizer):
+        """Val and test subsets have 500 samples each."""
+        val_ds = InstructionDataset(
+            tokenizer=tiny_tokenizer, max_seq_len=32, subset="val",
+        )
+        test_ds = InstructionDataset(
+            tokenizer=tiny_tokenizer, max_seq_len=32, subset="test",
+        )
+        assert len(val_ds) == 500
+        assert len(test_ds) == 500

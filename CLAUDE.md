@@ -16,9 +16,12 @@ Read it completely before making any changes.
 - Secondary (cross-architecture): LLaMA 3.1-8B → LLaMA 3.1-1B
 
 ### Dataset & evaluation
-- Training data: `databricks/databricks-dolly-15k`, train split, seed=42, max_seq_len=512
-- Primary metric: ROUGE-L on Dolly test-500
-- Secondary metric: Mean JSD (Saliency Loyalty) — mean teacher/student saliency divergence on val-500
+- Data: `databricks/databricks-dolly-15k`, shuffle(seed=42), max_seq_len=512
+- Train subset: first N-1000 samples (~14K) — used for training and saliency precomputation
+- Val subset: next 500 samples — used for saliency diagnosis, hyperparameter selection
+- Test subset: last 500 samples — used for final ROUGE-L reporting
+- Primary metric: ROUGE-L on test-500
+- Secondary metric: Mean JSD (Saliency Loyalty) on val-500
 - Benchmark defense: MMLU, ARC-Challenge, TruthfulQA (lm-eval-harness, appendix only)
 
 ### Environment
@@ -100,6 +103,13 @@ For a sample with `input_ids`, `attention_mask`, `labels_mask` (0=prompt, 1=resp
 
 **Teacher saliency** is precomputed once (teacher is frozen) and cached to disk.
 **Student saliency** is computed every N training steps.
+
+**Differentiable vs non-differentiable saliency**:
+- `compute()`: Non-differentiable. Used for teacher precomputation, diagnosis, and
+  reweighting signal. Returns detached tensor. No gradients flow to model parameters.
+- `compute_differentiable()`: Differentiable via `torch.autograd.grad(create_graph=True)`.
+  Used ONLY for student saliency in the alignment loss path. Returns tensor with gradient
+  graph intact so that sal_loss.backward() propagates to student parameters.
 
 ### 2.4 Per-Sample KL
 
@@ -248,8 +258,10 @@ Downstream functions (alignment loss, divergence) must NOT apply additional mask
 Non-SaGD methods silently ignore this field.
 
 ### 5.7 Cache/training alignment
-Precompute script must use identical data_source, seed, max_seq_len, tokenizer as
-training. Any mismatch silently corrupts the index→saliency mapping.
+Precompute script must use identical tokenizer, data_source, seed, max_seq_len, and
+subset as training. For cross-architecture experiments, use `--tokenizer_name` pointing
+to the STUDENT model (since training tokenizes with the student tokenizer).
+Any mismatch silently corrupts the index→saliency mapping.
 
 ### 5.8 Teacher is always frozen
 Teacher stays in `eval()` with `torch.no_grad()` throughout. Never modified.
@@ -257,6 +269,11 @@ Teacher stays in `eval()` with `torch.no_grad()` throughout. Never modified.
 ### 5.9 Baseline isolation
 When method is not `sagd`, zero SaGD components are initialized. Baselines run
 identically as if SaGD code did not exist.
+
+### 5.10 Saliency alignment loss requires differentiable saliency
+The alignment loss must use `compute_differentiable()` for the student. Using `compute()`
+(which returns detached tensors) makes the loss a constant that does not affect training.
+This is a critical correctness requirement.
 
 ---
 
@@ -358,4 +375,6 @@ python scripts/diagnose_saliency.py \
 - **Do not** mask saliency with only `(1 - labels_mask)` — must also multiply by `attention_mask`.
 - **Do not** skip the shift in KL/saliency mask — `logit[j]` predicts `token[j+1]`, use `labels_mask[:, 1:]`.
 - **Do not** let reweighting weights carry gradients — always `.detach()`.
-- **Do not** assume cache/training data alignment — verify same data_source, seed, max_seq_len, tokenizer.
+- **Do not** assume cache/training data alignment — verify same data_source, seed, max_seq_len, tokenizer, subset.
+- **Do not** use `compute()` for student saliency in the alignment loss — it returns detached tensors, making the loss term a no-op. Use `compute_differentiable()`.
+- **Do not** evaluate on training data — use subset="test" for ROUGE-L, subset="val" for diagnosis.

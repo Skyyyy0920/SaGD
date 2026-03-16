@@ -143,41 +143,70 @@ class TestSaliencyAlignmentLoss:
         assert loss.item() < 1e-6
         assert abs(stats["mean_cos_sim"] - 1.0) < 1e-6
 
-    def test_gradient_flows_to_student(self, tiny_model):
-        """Saliency alignment loss produces gradients for student parameters."""
+
+class TestSaliencyComputeDifferentiable:
+    def test_output_shape(self, tiny_model, sample_batch):
+        """Differentiable saliency has shape (B, L)."""
         model = copy.deepcopy(tiny_model)
         model.train()
         for p in model.parameters():
             p.requires_grad_(True)
+        computer = SaliencyComputer()
+        sal = computer.compute_differentiable(
+            model, sample_batch["input_ids"],
+            sample_batch["attention_mask"], sample_batch["labels_mask"],
+        )
+        B, L = sample_batch["input_ids"].shape
+        assert sal.shape == (B, L)
+
+    def test_requires_grad(self, tiny_model, sample_batch):
+        """Differentiable saliency has requires_grad=True."""
+        model = copy.deepcopy(tiny_model)
+        model.train()
+        for p in model.parameters():
+            p.requires_grad_(True)
+        computer = SaliencyComputer()
+        sal = computer.compute_differentiable(
+            model, sample_batch["input_ids"],
+            sample_batch["attention_mask"], sample_batch["labels_mask"],
+        )
+        assert sal.requires_grad, "Differentiable saliency must have requires_grad=True"
+
+    def test_gradient_reaches_model_params(self, tiny_model, sample_batch):
+        """sal_loss.backward() produces non-zero gradients on model parameters."""
+        model = copy.deepcopy(tiny_model)
+        model.train()
+        for p in model.parameters():
+            p.requires_grad_(True)
+            p.grad = None
 
         computer = SaliencyComputer()
         loss_fn = SaliencyAlignmentLoss()
 
-        B, L = 1, 6
-        input_ids = torch.randint(0, 100, (B, L))
-        attention_mask = torch.ones(B, L, dtype=torch.long)
-        labels_mask = torch.tensor([[0, 0, 0, 1, 1, 1]], dtype=torch.long)
+        student_sal = computer.compute_differentiable(
+            model, sample_batch["input_ids"],
+            sample_batch["attention_mask"], sample_batch["labels_mask"],
+        )
+        # Fake teacher saliency (fixed, no grad)
+        teacher_sal = torch.rand_like(student_sal).detach()
+        prompt_mask = (1 - sample_batch["labels_mask"]).float() * sample_batch["attention_mask"].float()
+        teacher_sal = teacher_sal * prompt_mask
 
-        # Teacher saliency (fixed)
-        teacher_sal = torch.rand(B, L) * (1 - labels_mask).float()
+        sal_loss, _ = loss_fn(teacher_sal, student_sal,
+                              sample_batch["labels_mask"], sample_batch["attention_mask"])
+        sal_loss.backward()
 
-        # Student saliency (needs grad flow)
-        embed_layer = model.get_input_embeddings()
-        embed = embed_layer(input_ids)  # NOT detached — grad flows through params
-        outputs = model(inputs_embeds=embed, attention_mask=attention_mask)
-        logits = outputs.logits[:, :-1, :]
-        targets = input_ids[:, 1:]
-        mask = labels_mask[:, 1:].float()
-        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-        token_lp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-        response_ll = (token_lp * mask).sum()
-        # Compute saliency-like gradient on embed
-        grad = torch.autograd.grad(response_ll, embed, create_graph=True)[0]
-        student_sal = grad.norm(dim=-1) * (1 - labels_mask).float()
+        has_grad = any(
+            p.grad is not None and p.grad.abs().sum() > 0
+            for p in model.parameters()
+        )
+        assert has_grad, "sal_loss.backward() produced no gradients on model parameters"
 
-        loss, _ = loss_fn(teacher_sal, student_sal, labels_mask, attention_mask)
-        loss.backward()
-
-        has_grad = any(p.grad is not None and p.grad.abs().sum() > 0
-                       for p in model.parameters())
-        assert has_grad, "No gradients flowed to model parameters"
+    def test_non_differentiable_has_no_grad(self, tiny_model, sample_batch):
+        """Contrast: compute() returns tensor without grad."""
+        computer = SaliencyComputer()
+        sal = computer.compute(
+            tiny_model, sample_batch["input_ids"],
+            sample_batch["attention_mask"], sample_batch["labels_mask"],
+        )
+        assert not sal.requires_grad, "Non-differentiable compute() should return detached tensor"

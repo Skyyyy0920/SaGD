@@ -29,6 +29,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_samples", type=int, default=500)
     p.add_argument("--max_seq_len", type=int, default=512)
     p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--subset", type=str, default="val",
+                    choices=["train", "val", "test"])
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
@@ -57,6 +59,7 @@ def main() -> None:
         max_seq_len=args.max_seq_len,
         max_samples=args.max_samples,
         seed=args.seed,
+        subset=args.subset,
     )
 
     dataloader = torch.utils.data.DataLoader(

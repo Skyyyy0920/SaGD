@@ -14,7 +14,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from sagd.data import InstructionDataset
-from sagd.evaluation import evaluate_rouge
+from sagd.evaluation import evaluate_all
 from sagd.models import load_student, load_teacher
 from sagd.trainer import METHODS, Trainer
 
@@ -58,6 +58,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output_dir", type=str, default="outputs/")
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--skip_eval", action="store_true")
+    p.add_argument("--skip_bertscore", action="store_true",
+                    help="Skip BERTScore in post-training eval")
     p.add_argument("--log_every", type=int, default=50)
 
     return p.parse_args()
@@ -137,11 +139,15 @@ def main() -> None:
             seed=args.seed,
             subset="test",
         )
-        metrics = evaluate_rouge(
+        metrics = evaluate_all(
             student, s_tokenizer, eval_dataset,
             device=args.device,
+            skip_bertscore=args.skip_bertscore,
         )
-        print(f"ROUGE-L F1: {metrics['rouge_l_f']:.4f}")
+        print(f"ROUGE-L F1:  {metrics['rouge_l_f']:.4f}")
+        if "bertscore_f" in metrics:
+            print(f"BERTScore F1: {metrics['bertscore_f']:.4f}")
+        print(f"Perplexity:  {metrics['perplexity']:.2f}")
         with open(os.path.join(save_dir, "eval_metrics.json"), "w") as f:
             json.dump(metrics, f, indent=2)
 

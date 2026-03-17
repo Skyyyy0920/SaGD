@@ -15,6 +15,9 @@ dependencies = [
 
 [project.optional-dependencies]
 eval = ["lm-eval>=0.4"]
+bertscore = ["bert-score>=0.3.13"]
+judge = ["openai>=1.0"]
+all-eval = ["bert-score>=0.3.13", "openai>=1.0"]
 dev = ["pytest>=7.4", "pytest-timeout>=2.2"]
 
 [build-system]

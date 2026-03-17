@@ -583,3 +583,90 @@ python scripts/train.py \
 | §4.6 | Exp 5 | 哪些样本 saliency 偏差最大？ | per-category JSD, case study |
 | §4.7 | Exp 6 | 跨架构能泛化吗？ | ROUGE-L on LLaMA pair |
 | Appendix | Exp 7 | 通用能力有损害吗？ | MMLU, ARC-C, TruthfulQA |
+
+---
+
+## 扩展评测系统
+
+### 评测指标一览
+
+| 指标 | 用途 | 是否需要生成 | 备注 |
+|------|------|:---:|------|
+| ROUGE-L | 文本重叠度 | 是 | 主指标 |
+| BERTScore | 语义相似度 | 是 | 可选（需 `bert-score`） |
+| Perplexity | 语言模型质量 | 否（teacher-forced） | 越低越好 |
+| GPT-as-Judge | 人类偏好代理 | 是（预生成） | 需 OpenAI API |
+| Mean JSD | Saliency 忠诚度 | 否 | 二级指标 |
+
+### 安装可选依赖
+
+```bash
+# BERTScore
+pip install bert-score
+
+# GPT-as-Judge
+pip install openai
+export OPENAI_API_KEY="sk-..."
+
+# 或一次性安装全部
+pip install -e ".[all-eval]"
+```
+
+### 完整评测流程
+
+#### Step 1: 预生成 responses（每个 checkpoint 一次）
+
+```bash
+for METHOD in standard_kd reverse_kl sagd; do
+    for SEED in 42 123 456; do
+        python scripts/generate_responses.py \
+            --student_ckpt outputs/${METHOD}/seed_${SEED}/student_final.pt \
+            --output_path outputs/${METHOD}/seed_${SEED}/responses.jsonl \
+            --subset test \
+            --device cuda:0
+    done
+done
+```
+
+#### Step 2: 自动指标评测（ROUGE-L + BERTScore + Perplexity）
+
+```bash
+for METHOD in standard_kd reverse_kl sagd; do
+    for SEED in 42 123 456; do
+        python scripts/evaluate.py \
+            --student_ckpt outputs/${METHOD}/seed_${SEED}/student_final.pt \
+            --output_path outputs/${METHOD}/seed_${SEED}/eval_metrics.json \
+            --subset test \
+            --device cuda:0
+            # 加 --skip_bertscore 跳过 BERTScore（更快）
+    done
+done
+```
+
+#### Step 3: GPT-as-Judge 对比（需 OpenAI API）
+
+```bash
+# Standard KD vs SaGD
+python scripts/gpt_judge.py \
+    --responses_a outputs/standard_kd/seed_42/responses.jsonl \
+    --responses_b outputs/sagd/seed_42/responses.jsonl \
+    --label_a "Standard KD" \
+    --label_b "SaGD" \
+    --output_path outputs/gpt_judge_std_vs_sagd_seed42.json
+
+# Reverse KL vs SaGD
+python scripts/gpt_judge.py \
+    --responses_a outputs/reverse_kl/seed_42/responses.jsonl \
+    --responses_b outputs/sagd/seed_42/responses.jsonl \
+    --label_a "Reverse KL" \
+    --label_b "SaGD" \
+    --output_path outputs/gpt_judge_rkl_vs_sagd_seed42.json
+```
+
+### 扩展主实验表格式
+
+| Method | ROUGE-L ↑ | BERTScore ↑ | PPL ↓ | Mean JSD ↓ | GPT-Judge Win% ↑ |
+|--------|-----------|-------------|-------|------------|-------------------|
+| Standard KD | x.xx ± x.xx | x.xx ± x.xx | x.xx | x.xx ± x.xx | — (baseline) |
+| Reverse KL | x.xx ± x.xx | x.xx ± x.xx | x.xx | x.xx ± x.xx | vs Std KD: x% |
+| **SaGD** | **x.xx ± x.xx** | **x.xx ± x.xx** | **x.xx** | **x.xx ± x.xx** | **vs Std KD: x%** |

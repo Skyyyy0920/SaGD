@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Standalone evaluation script for trained student models."""
+"""Standalone evaluation script for trained student models.
+
+Computes ROUGE-L, BERTScore (optional), and Perplexity.
+Optionally saves pre-generated responses to JSONL for later GPT-as-Judge use.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +17,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from sagd.data import InstructionDataset
-from sagd.evaluation import evaluate_rouge
+from sagd.evaluation import evaluate_all, generate_responses, save_responses
 from sagd.models import load_student
 
 
@@ -30,6 +34,12 @@ def parse_args() -> argparse.Namespace:
                     choices=["train", "val", "test"])
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--output_path", type=str, default=None)
+    p.add_argument("--save_responses", type=str, default=None,
+                    help="Path to save generated responses as JSONL (for GPT-as-Judge)")
+    p.add_argument("--skip_bertscore", action="store_true",
+                    help="Skip BERTScore computation (faster)")
+    p.add_argument("--bertscore_model", type=str, default="microsoft/deberta-xlarge-mnli",
+                    help="BERTScore encoder model")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -54,22 +64,44 @@ def main() -> None:
         subset=args.subset,
     )
 
-    metrics = evaluate_rouge(
+    # Run all metrics
+    metrics = evaluate_all(
         student, tokenizer, dataset,
         max_new_tokens=args.max_new_tokens,
         batch_size=args.batch_size,
         device=args.device,
+        skip_bertscore=args.skip_bertscore,
+        bertscore_model=args.bertscore_model,
     )
 
-    print(f"ROUGE-L F1:  {metrics['rouge_l_f']:.4f}")
-    print(f"ROUGE-L P:   {metrics['rouge_l_p']:.4f}")
-    print(f"ROUGE-L R:   {metrics['rouge_l_r']:.4f}")
+    # Print results
+    print(f"ROUGE-L F1:   {metrics['rouge_l_f']:.4f}")
+    print(f"ROUGE-L P:    {metrics['rouge_l_p']:.4f}")
+    print(f"ROUGE-L R:    {metrics['rouge_l_r']:.4f}")
+    if "bertscore_f" in metrics:
+        print(f"BERTScore F1: {metrics['bertscore_f']:.4f}")
+        print(f"BERTScore P:  {metrics['bertscore_p']:.4f}")
+        print(f"BERTScore R:  {metrics['bertscore_r']:.4f}")
+    print(f"Perplexity:   {metrics['perplexity']:.2f}")
+    print(f"Avg NLL:      {metrics['avg_loss']:.4f}")
 
+    # Save metrics
     if args.output_path:
         os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
         with open(args.output_path, "w") as f:
             json.dump(metrics, f, indent=2)
-        print(f"Saved to {args.output_path}")
+        print(f"Saved metrics to {args.output_path}")
+
+    # Optionally save responses for GPT-as-Judge
+    if args.save_responses:
+        responses = generate_responses(
+            student, tokenizer, dataset,
+            max_new_tokens=args.max_new_tokens,
+            batch_size=args.batch_size,
+            device=args.device,
+        )
+        save_responses(responses, args.save_responses)
+        print(f"Saved responses to {args.save_responses}")
 
 
 if __name__ == "__main__":

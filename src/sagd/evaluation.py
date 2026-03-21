@@ -1,9 +1,10 @@
-"""Evaluation metrics for instruction-following: ROUGE-L, BERTScore, Perplexity."""
+"""Evaluation metrics: ROUGE-L, BERTScore, Perplexity, EM/F1, Evidence Concentration."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Union
 
 import torch
 import torch.nn as nn
@@ -11,7 +12,7 @@ from rouge_score import rouge_scorer
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
-from sagd.data import InstructionDataset
+from sagd.data import InstructionDataset, SquadDataset, normalize_answer
 
 
 # ---------------------------------------------------------------------------
@@ -21,19 +22,23 @@ from sagd.data import InstructionDataset
 def generate_responses(
     model: nn.Module,
     tokenizer: PreTrainedTokenizer,
-    dataset: InstructionDataset,
+    dataset: Union[InstructionDataset, SquadDataset],
     max_new_tokens: int = 256,
     batch_size: int = 8,
     device: str = "cuda",
 ) -> list[dict[str, str]]:
     """Generate responses for every sample in *dataset*.
 
+    Works with both InstructionDataset (Dolly) and SquadDataset (SQuAD).
+    Uses ``get_metadata()`` which returns ``instruction``, ``response``,
+    and ``category`` keys for both dataset types.
+
     Returns a list of dicts, each with keys:
         - ``"index"``: int — dataset index
-        - ``"instruction"``: str — prompt text
-        - ``"reference"``: str — ground-truth response
+        - ``"instruction"``: str — prompt text (question for SQuAD)
+        - ``"reference"``: str — ground-truth response (answer for SQuAD)
         - ``"generated"``: str — model-generated response
-        - ``"category"``: str — Dolly category
+        - ``"category"``: str — task category
     """
     model.eval()
     results: list[dict[str, str]] = []
@@ -148,7 +153,118 @@ def compute_rouge(responses: list[dict]) -> dict[str, float]:
 
 
 # ---------------------------------------------------------------------------
-# 3. BERTScore
+# 3. Exact Match / Token F1 (SQuAD-style QA)
+# ---------------------------------------------------------------------------
+
+def compute_exact_match_f1(responses: list[dict]) -> dict[str, float]:
+    """Compute Exact Match and token-level F1 from pre-generated responses.
+
+    Uses the standard SQuAD normalization: lowercase, remove articles,
+    remove punctuation, collapse whitespace.
+
+    Args:
+        responses: list of dicts with ``"reference"`` and ``"generated"`` keys.
+
+    Returns:
+        ``{"exact_match": float, "token_f1": float}``
+    """
+    em_scores = []
+    f1_scores = []
+
+    for r in responses:
+        ref_norm = normalize_answer(r["reference"])
+        gen_norm = normalize_answer(r["generated"])
+
+        # Exact Match
+        em_scores.append(1.0 if ref_norm == gen_norm else 0.0)
+
+        # Token F1
+        ref_tokens = ref_norm.split()
+        gen_tokens = gen_norm.split()
+
+        if not ref_tokens and not gen_tokens:
+            f1_scores.append(1.0)
+            continue
+        if not ref_tokens or not gen_tokens:
+            f1_scores.append(0.0)
+            continue
+
+        common = set(ref_tokens) & set(gen_tokens)
+        n_common = sum(min(ref_tokens.count(t), gen_tokens.count(t)) for t in common)
+
+        if n_common == 0:
+            f1_scores.append(0.0)
+            continue
+
+        precision = n_common / len(gen_tokens)
+        recall = n_common / len(ref_tokens)
+        f1_scores.append(2 * precision * recall / (precision + recall))
+
+    n = max(len(em_scores), 1)
+    return {
+        "exact_match": sum(em_scores) / n,
+        "token_f1": sum(f1_scores) / n,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 4. Evidence Concentration (SQuAD saliency evaluation)
+# ---------------------------------------------------------------------------
+
+def compute_evidence_concentration(
+    saliency: torch.Tensor,           # (B, L)
+    answer_token_start: torch.Tensor,  # (B,)
+    answer_token_end: torch.Tensor,    # (B,)
+    attention_mask: torch.Tensor,      # (B, L)
+) -> dict[str, float]:
+    """Compute fraction of saliency mass within the answer span.
+
+    For each sample, computes:
+        evidence_conc = sum(saliency[answer_start:answer_end+1]) / sum(saliency)
+
+    Skips samples where answer span is unmapped (start == -1).
+
+    Args:
+        saliency: Pre-masked saliency (response/padding already zeroed).
+        answer_token_start: Start token index of answer span, -1 if unmapped.
+        answer_token_end: End token index (inclusive) of answer span, -1 if unmapped.
+        attention_mask: Attention mask for the batch.
+
+    Returns:
+        ``{"evidence_concentration": float, "n_valid_samples": int}``
+    """
+    B, L = saliency.shape
+    concentrations = []
+
+    for i in range(B):
+        start = answer_token_start[i].item()
+        end = answer_token_end[i].item()
+
+        if start < 0 or end < 0:
+            continue  # skip unmapped spans
+
+        total_sal = saliency[i].sum().item()
+        if total_sal < 1e-10:
+            continue  # skip zero-saliency samples
+
+        # Clamp to valid range
+        start = max(0, min(start, L - 1))
+        end = max(0, min(end, L - 1))
+
+        answer_sal = saliency[i, start:end + 1].sum().item()
+        concentrations.append(answer_sal / total_sal)
+
+    n_valid = len(concentrations)
+    mean_conc = sum(concentrations) / max(n_valid, 1)
+
+    return {
+        "evidence_concentration": mean_conc,
+        "n_valid_samples": n_valid,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 5. BERTScore
 # ---------------------------------------------------------------------------
 
 def compute_bertscore(
@@ -191,13 +307,13 @@ def compute_bertscore(
 
 
 # ---------------------------------------------------------------------------
-# 4. Perplexity
+# 6. Perplexity
 # ---------------------------------------------------------------------------
 
 def compute_perplexity(
     model: nn.Module,
     tokenizer: PreTrainedTokenizer,
-    dataset: InstructionDataset,
+    dataset: Union[InstructionDataset, SquadDataset],
     batch_size: int = 8,
     device: str = "cuda",
 ) -> dict[str, float]:
@@ -263,23 +379,30 @@ def compute_perplexity(
 
 
 # ---------------------------------------------------------------------------
-# 5. Combined evaluation
+# 7. Combined evaluation
 # ---------------------------------------------------------------------------
 
 def evaluate_all(
     model: nn.Module,
     tokenizer: PreTrainedTokenizer,
-    dataset: InstructionDataset,
+    dataset: Union[InstructionDataset, SquadDataset],
     max_new_tokens: int = 256,
     batch_size: int = 8,
     device: str = "cuda",
     skip_bertscore: bool = False,
     bertscore_model: str = "microsoft/deberta-xlarge-mnli",
+    dataset_type: str = "dolly",
 ) -> dict[str, float]:
-    """Run all metrics: ROUGE-L, BERTScore (optional), Perplexity.
+    """Run all applicable metrics.
 
-    Generates responses once, then reuses them across ROUGE-L and BERTScore.
+    For Dolly: ROUGE-L, BERTScore (optional), Perplexity.
+    For SQuAD: EM, Token F1, ROUGE-L, Perplexity.
+
+    Generates responses once, then reuses them across text-overlap metrics.
     Perplexity is computed separately (teacher-forced, no generation needed).
+
+    Args:
+        dataset_type: ``"dolly"`` or ``"squad"``. Controls which metrics to compute.
 
     Returns dict with all metric keys merged.
     """
@@ -291,10 +414,15 @@ def evaluate_all(
         device=device,
     )
 
-    # 2. ROUGE-L
+    # 2. ROUGE-L (both datasets)
     metrics = compute_rouge(responses)
 
-    # 3. BERTScore (optional)
+    # 3. EM / F1 (SQuAD only)
+    if dataset_type == "squad":
+        qa_metrics = compute_exact_match_f1(responses)
+        metrics.update(qa_metrics)
+
+    # 4. BERTScore (optional, both datasets)
     if not skip_bertscore:
         try:
             bs_metrics = compute_bertscore(
@@ -304,7 +432,7 @@ def evaluate_all(
         except ImportError:
             print("WARNING: bert-score not installed, skipping BERTScore.")
 
-    # 4. Perplexity
+    # 5. Perplexity
     ppl_metrics = compute_perplexity(
         model, tokenizer, dataset,
         batch_size=batch_size, device=device,
@@ -315,13 +443,13 @@ def evaluate_all(
 
 
 # ---------------------------------------------------------------------------
-# 6. Legacy API (backward-compatible)
+# 8. Legacy API (backward-compatible)
 # ---------------------------------------------------------------------------
 
 def evaluate_rouge(
     model: nn.Module,
     tokenizer: PreTrainedTokenizer,
-    dataset: InstructionDataset,
+    dataset: Union[InstructionDataset, SquadDataset],
     max_new_tokens: int = 256,
     batch_size: int = 8,
     device: str = "cuda",

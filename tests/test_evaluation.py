@@ -10,6 +10,8 @@ import pytest
 import torch
 
 from sagd.evaluation import (
+    compute_evidence_concentration,
+    compute_exact_match_f1,
     compute_perplexity,
     compute_rouge,
     generate_responses,
@@ -183,3 +185,112 @@ def _simulate_aggregation(v_ab: str, v_ba: str) -> str:
     if v_ab == v_ba:
         return v_ab
     return "TIE"
+
+
+# =========================================================================
+# Exact Match / Token F1 Tests
+# =========================================================================
+
+class TestExactMatchF1:
+    def test_perfect_match(self):
+        """Identical reference/generated → EM=1, F1=1."""
+        responses = [
+            {"reference": "France", "generated": "France"},
+            {"reference": "April 17, 2011", "generated": "April 17, 2011"},
+        ]
+        metrics = compute_exact_match_f1(responses)
+        assert metrics["exact_match"] == 1.0
+        assert metrics["token_f1"] == 1.0
+
+    def test_case_insensitive(self):
+        """EM should be case-insensitive."""
+        responses = [{"reference": "France", "generated": "france"}]
+        metrics = compute_exact_match_f1(responses)
+        assert metrics["exact_match"] == 1.0
+
+    def test_article_removal(self):
+        """Articles should be removed before comparison."""
+        responses = [{"reference": "the Eiffel Tower", "generated": "Eiffel Tower"}]
+        metrics = compute_exact_match_f1(responses)
+        assert metrics["exact_match"] == 1.0
+
+    def test_no_match(self):
+        """Completely different → EM=0."""
+        responses = [{"reference": "France", "generated": "Germany"}]
+        metrics = compute_exact_match_f1(responses)
+        assert metrics["exact_match"] == 0.0
+
+    def test_partial_match_f1(self):
+        """Partial overlap → F1 between 0 and 1."""
+        responses = [{"reference": "quick brown fox", "generated": "quick red fox"}]
+        metrics = compute_exact_match_f1(responses)
+        assert metrics["exact_match"] == 0.0
+        assert 0.0 < metrics["token_f1"] < 1.0
+
+    def test_empty_both(self):
+        """Both empty → perfect match."""
+        responses = [{"reference": "", "generated": ""}]
+        metrics = compute_exact_match_f1(responses)
+        assert metrics["exact_match"] == 1.0
+        assert metrics["token_f1"] == 1.0
+
+
+# =========================================================================
+# Evidence Concentration Tests
+# =========================================================================
+
+class TestEvidenceConcentration:
+    def test_all_mass_on_answer(self):
+        """All saliency on answer span → concentration = 1.0."""
+        B, L = 2, 10
+        saliency = torch.zeros(B, L)
+        saliency[:, 3:6] = 1.0  # answer span is [3, 5]
+        answer_start = torch.tensor([3, 3])
+        answer_end = torch.tensor([5, 5])
+        attention_mask = torch.ones(B, L, dtype=torch.long)
+
+        result = compute_evidence_concentration(
+            saliency, answer_start, answer_end, attention_mask,
+        )
+        assert abs(result["evidence_concentration"] - 1.0) < 1e-6
+        assert result["n_valid_samples"] == 2
+
+    def test_no_mass_on_answer(self):
+        """All saliency outside answer span → concentration ≈ 0."""
+        B, L = 1, 10
+        saliency = torch.zeros(B, L)
+        saliency[:, 0:3] = 1.0  # saliency at [0,1,2]
+        answer_start = torch.tensor([5])
+        answer_end = torch.tensor([7])  # answer at [5,6,7]
+        attention_mask = torch.ones(B, L, dtype=torch.long)
+
+        result = compute_evidence_concentration(
+            saliency, answer_start, answer_end, attention_mask,
+        )
+        assert result["evidence_concentration"] < 1e-6
+
+    def test_unmapped_spans_skipped(self):
+        """Samples with answer_start=-1 should be skipped."""
+        B, L = 2, 10
+        saliency = torch.ones(B, L)
+        answer_start = torch.tensor([3, -1])  # second sample unmapped
+        answer_end = torch.tensor([5, -1])
+        attention_mask = torch.ones(B, L, dtype=torch.long)
+
+        result = compute_evidence_concentration(
+            saliency, answer_start, answer_end, attention_mask,
+        )
+        assert result["n_valid_samples"] == 1
+
+    def test_zero_saliency_skipped(self):
+        """Samples with zero total saliency should be skipped."""
+        B, L = 1, 10
+        saliency = torch.zeros(B, L)
+        answer_start = torch.tensor([3])
+        answer_end = torch.tensor([5])
+        attention_mask = torch.ones(B, L, dtype=torch.long)
+
+        result = compute_evidence_concentration(
+            saliency, answer_start, answer_end, attention_mask,
+        )
+        assert result["n_valid_samples"] == 0

@@ -1,11 +1,11 @@
-"""Tests for the instruction dataset and collate function."""
+"""Tests for the instruction dataset, SQuAD dataset, and collate function."""
 
 from __future__ import annotations
 
 import pytest
 import torch
 
-from sagd.data import InstructionDataset, collate_fn
+from sagd.data import InstructionDataset, SquadDataset, collate_fn, normalize_answer
 
 
 @pytest.fixture(scope="module")
@@ -127,3 +127,128 @@ class TestSubsetSplits:
         )
         assert len(val_ds) == 500
         assert len(test_ds) == 500
+
+
+# =========================================================================
+# SQuAD Dataset Tests
+# =========================================================================
+
+@pytest.fixture(scope="module")
+def small_squad_dataset(tiny_tokenizer):
+    """Create a small SQuAD dataset for testing."""
+    return SquadDataset(
+        tokenizer=tiny_tokenizer,
+        dataset_name="rajpurkar/squad_v2",
+        max_seq_len=128,
+        max_samples=10,
+        seed=42,
+    )
+
+
+class TestSquadDataset:
+    def test_returns_index(self, small_squad_dataset):
+        """__getitem__ must include 'index' as a scalar tensor."""
+        item = small_squad_dataset[0]
+        assert "index" in item
+        assert item["index"].dim() == 0
+        assert item["index"].dtype == torch.long
+
+    def test_all_keys_present(self, small_squad_dataset):
+        """Each item has standard keys plus answer span fields."""
+        item = small_squad_dataset[0]
+        for key in ["input_ids", "attention_mask", "labels_mask", "index",
+                     "answer_token_start", "answer_token_end"]:
+            assert key in item, f"Missing key: {key}"
+
+    def test_answer_span_fields_are_scalars(self, small_squad_dataset):
+        """Answer span fields are scalar long tensors."""
+        item = small_squad_dataset[0]
+        assert item["answer_token_start"].dim() == 0
+        assert item["answer_token_start"].dtype == torch.long
+        assert item["answer_token_end"].dim() == 0
+        assert item["answer_token_end"].dtype == torch.long
+
+    def test_shapes_consistent(self, small_squad_dataset):
+        """input_ids, attention_mask, labels_mask all have same length."""
+        item = small_squad_dataset[0]
+        L = item["input_ids"].size(0)
+        assert item["attention_mask"].size(0) == L
+        assert item["labels_mask"].size(0) == L
+
+    def test_labels_mask_starts_with_prompt(self, small_squad_dataset):
+        """labels_mask must start with 0 (prompt)."""
+        item = small_squad_dataset[0]
+        assert item["labels_mask"][0].item() == 0
+
+    def test_answer_span_within_bounds(self, small_squad_dataset):
+        """If answer span is mapped (>=0), it must be within sequence length."""
+        for i in range(len(small_squad_dataset)):
+            item = small_squad_dataset[i]
+            start = item["answer_token_start"].item()
+            end = item["answer_token_end"].item()
+            L = item["input_ids"].size(0)
+            if start >= 0:
+                assert 0 <= start < L, f"start={start} out of range [0, {L})"
+                assert 0 <= end < L, f"end={end} out of range [0, {L})"
+                assert start <= end, f"start={start} > end={end}"
+
+    def test_filters_unanswerable(self, small_squad_dataset):
+        """All samples should have valid answer text."""
+        for i in range(len(small_squad_dataset)):
+            meta = small_squad_dataset.get_metadata(i)
+            assert len(meta["response"]) > 0, f"Sample {i} has empty answer"
+
+    def test_get_metadata_keys(self, small_squad_dataset):
+        """get_metadata returns expected keys."""
+        meta = small_squad_dataset.get_metadata(0)
+        for key in ["instruction", "response", "context", "category"]:
+            assert key in meta, f"Missing metadata key: {key}"
+        assert meta["category"] == "extractive_qa"
+
+    def test_collate_fn_with_answer_span(self, small_squad_dataset):
+        """collate_fn handles answer span fields."""
+        items = [small_squad_dataset[i] for i in range(min(3, len(small_squad_dataset)))]
+        batch = collate_fn(items)
+        B = len(items)
+        assert "answer_token_start" in batch
+        assert "answer_token_end" in batch
+        assert batch["answer_token_start"].shape == (B,)
+        assert batch["answer_token_end"].shape == (B,)
+
+    def test_span_mapping_rate_positive(self, small_squad_dataset):
+        """At least some spans should be successfully mapped."""
+        assert small_squad_dataset.span_mapping_rate > 0.0
+
+
+class TestSquadSubsetSplits:
+    def test_val_and_test_differ(self, tiny_tokenizer):
+        """Val and test subsets should contain different samples."""
+        val_ds = SquadDataset(
+            tokenizer=tiny_tokenizer, max_seq_len=64, max_samples=5,
+            seed=42, subset="val",
+        )
+        test_ds = SquadDataset(
+            tokenizer=tiny_tokenizer, max_seq_len=64, max_samples=5,
+            seed=42, subset="test",
+        )
+        val_q = val_ds.get_metadata(0)["instruction"]
+        test_q = test_ds.get_metadata(0)["instruction"]
+        # Very unlikely to be the same question
+        assert val_q != test_q or len(val_ds) != len(test_ds)
+
+
+class TestNormalizeAnswer:
+    def test_lowercase(self):
+        assert normalize_answer("Hello World") == "hello world"
+
+    def test_remove_articles(self):
+        assert normalize_answer("the quick a fox an apple") == "quick fox apple"
+
+    def test_remove_punctuation(self):
+        assert normalize_answer("hello, world!") == "hello world"
+
+    def test_collapse_whitespace(self):
+        assert normalize_answer("hello   world") == "hello world"
+
+    def test_combined(self):
+        assert normalize_answer("The Quick, Brown Fox!") == "quick brown fox"

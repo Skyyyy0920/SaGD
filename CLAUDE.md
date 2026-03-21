@@ -15,14 +15,27 @@ Read it completely before making any changes.
 - Primary: Qwen3-8B (teacher) → Qwen3-0.6B (student)
 - Secondary (cross-architecture): LLaMA 3.1-8B → LLaMA 3.1-1B
 
-### Dataset & evaluation
-- Data: `databricks/databricks-dolly-15k`, shuffle(seed=42), max_seq_len=512
-- Train subset: first N-1000 samples (~14K) — used for training and saliency precomputation
-- Val subset: next 500 samples — used for saliency diagnosis, hyperparameter selection
-- Test subset: last 500 samples — used for final ROUGE-L reporting
+### Datasets & evaluation
+
+**Primary: SQuAD 2.0** (`rajpurkar/squad_v2`) — extractive QA, context-dependent
+- Every sample has a context paragraph + question; answer must be extracted from context
+- Answerable subset only (unanswerable questions filtered out, ~86K train, ~5.9K val)
+- Train: HF `train` split, shuffled(seed=42)
+- Val/Test: HF `validation` split, shuffled, split in half (first half=val, second half=test)
+- Primary metrics: Exact Match (EM), Token F1 on test split
+- Saliency metric: Evidence Concentration (fraction of saliency mass on answer span)
+- Secondary metric: Mean JSD (Saliency Loyalty) on val split
+- Answer span token positions tracked for evidence concentration evaluation
+
+**Secondary: Dolly-15K** (`databricks/databricks-dolly-15k`) — instruction-following, generalization
+- shuffle(seed=42), max_seq_len=512
+- Train subset: first N-1000 samples (~14K)
+- Val subset: next 500 samples
+- Test subset: last 500 samples
 - Primary metric: ROUGE-L on test-500
-- Secondary metric: Mean JSD (Saliency Loyalty) on val-500
-- Benchmark defense: MMLU, ARC-Challenge, TruthfulQA (lm-eval-harness, appendix only)
+- Used to demonstrate SaGD generalizes beyond extractive QA
+
+**Benchmark defense**: MMLU, ARC-Challenge, TruthfulQA (lm-eval-harness, appendix only)
 
 ### Environment
 - Hardware: 4× A100 80GB
@@ -151,15 +164,37 @@ Each training step:
 ```python
 {
     "saliency": List[Tensor],  # each (L_i,) = full sequence length, response positions = 0
-    "metadata": {"model": str, "data": str, "n_samples": int, "max_seq_len": int}
+    "metadata": {"model": str, "data": str, "dataset": str, "n_samples": int, "max_seq_len": int}
 }
 ```
 
 Cache stores full-sequence-length saliency (prompt + response, response = 0).
 Retrieved by dataset index during training, padded/trimmed to batch sequence length.
-Must use identical data_source, seed, max_seq_len, tokenizer as training.
+Must use identical data_source, seed, max_seq_len, tokenizer, dataset type as training.
 
-### 2.7 Ablation Theory Correspondence
+### 2.7 Evidence Concentration (SQuAD-specific evaluation)
+
+For SQuAD samples with annotated answer spans, evidence concentration measures
+what fraction of saliency mass falls on the answer span tokens:
+
+```
+evidence_concentration_i = sum(saliency[answer_start : answer_end + 1]) / sum(saliency)
+```
+
+- Teacher's EC should be high (teacher "looks at" the evidence)
+- SaGD student's EC should approach teacher's EC
+- Standard KD student's EC should be lower (doesn't preserve where to look)
+
+This directly validates the core claim: SaGD teaches students WHERE to look, not just
+WHAT to output. Unlike Mean JSD (which measures distribution divergence), EC has
+ground-truth: the answer span IS the evidence the model should attend to.
+
+Answer span token mapping: `SquadDataset` maps character offsets from SQuAD annotations
+to token positions using `return_offsets_mapping=True` from the fast tokenizer.
+Samples where mapping fails (e.g., truncated) have `answer_token_start = -1` and are
+excluded from EC computation.
+
+### 2.8 Ablation Theory Correspondence
 
 | Config | KL (zero-order) | Sal loss (first-order) | Reweight | Theoretical space |
 |--------|-----------------|------------------------|----------|-------------------|
@@ -253,15 +288,16 @@ through the JSD → softmax → weights path.
 Downstream functions (alignment loss, divergence) must NOT apply additional masking.
 
 ### 5.6 Dataset must return index
-`__getitem__` returns `"index": torch.tensor(idx, dtype=torch.long)`.
-`collate_fn` stacks it with `torch.stack([b["index"] for b in batch])`.
-Non-SaGD methods silently ignore this field.
+Both `InstructionDataset` and `SquadDataset` return `"index": torch.tensor(idx, dtype=torch.long)`.
+`collate_fn` stacks it. `SquadDataset` additionally returns `answer_token_start` and
+`answer_token_end` (long scalars, -1 if unmapped). `collate_fn` conditionally stacks these.
+Non-SaGD methods silently ignore extra fields.
 
 ### 5.7 Cache/training alignment
-Precompute script must use identical tokenizer, data_source, seed, max_seq_len, and
-subset as training. For cross-architecture experiments, use `--tokenizer_name` pointing
-to the STUDENT model (since training tokenizes with the student tokenizer).
-Any mismatch silently corrupts the index→saliency mapping.
+Precompute script must use identical tokenizer, data_source, dataset type, seed,
+max_seq_len, and subset as training. For cross-architecture experiments, use
+`--tokenizer_name` pointing to the STUDENT model (since training tokenizes with the
+student tokenizer). Any mismatch silently corrupts the index→saliency mapping.
 
 ### 5.8 Teacher is always frozen
 Teacher stays in `eval()` with `torch.no_grad()` throughout. Never modified.
@@ -298,13 +334,15 @@ This is a critical correctness requirement.
 
 ### 7.1 Checklist
 ```
-Phase 0  Precompute teacher saliency          1 GPU   ~1h
-Phase 1  Exp 1: Saliency divergence diagnosis  1 GPU   ~1h     §4.2
-Phase 2  Exp 2: Main table (3 methods × 3 seeds) 4 GPU ~6h    §4.3
-Phase 3  Exp 3: Ablations (~15 runs)           4 GPU   ~8h     §4.4
-Phase 4  Exp 4-5: Dynamics + analysis          1 GPU   ~3h     §4.5-4.6
-Phase 5  Exp 6: Cross-arch LLaMA (optional)    1 GPU   ~4h     §4.7
-Phase 6  Exp 7: Benchmark defense              1 GPU   ~2h     Appendix
+Phase 0  Precompute teacher saliency (SQuAD)   1 GPU   ~2h
+Phase 1  Exp 1: Saliency divergence diagnosis   1 GPU   ~1h     §4.2
+Phase 2  Exp 2: Main table SQuAD (3×3)          4 GPU   ~6h     §4.3
+Phase 3  Exp 3: Evidence Concentration           1 GPU   ~1h     §4.4
+Phase 4  Exp 4: Ablations (~15 runs)             4 GPU   ~8h     §4.5
+Phase 5  Exp 5: Training Dynamics                1 GPU   ~2h     §4.6
+Phase 6  Exp 6: Dolly generalization             4 GPU   ~6h     §4.7
+Phase 7  Exp 7: Cross-arch LLaMA                 1 GPU   ~4h     §4.8
+Phase 8  Exp 8: Benchmark defense                1 GPU   ~2h     Appendix
 ```
 
 ### 7.2 Paper structure
@@ -320,11 +358,12 @@ Phase 6  Exp 7: Benchmark defense              1 GPU   ~2h     Appendix
 §4 Experiments
   4.1 Setup
   4.2 Motivation: Does Standard KD Preserve Saliency?    ← Exp 1
-  4.3 Main Results                                        ← Exp 2
-  4.4 Ablation Study                                      ← Exp 3
-  4.5 Training Dynamics                                   ← Exp 4
-  4.6 Analysis: When Does the Student Look Wrong?         ← Exp 5
-  4.7 Cross-Architecture Generalization                   ← Exp 6
+  4.3 Main Results (SQuAD: EM, F1, EC)                   ← Exp 2
+  4.4 Evidence Concentration Analysis                     ← Exp 3
+  4.5 Ablation Study                                      ← Exp 4
+  4.6 Training Dynamics                                   ← Exp 5
+  4.7 Generalization to Instruction-Following (Dolly)     ← Exp 6
+  4.8 Cross-Architecture Generalization (LLaMA)           ← Exp 7
 §5 Discussion & Limitations
 Appendix: Proofs, Benchmark Defense, Hyperparameter Sensitivity, Visualizations
 ```
@@ -333,22 +372,28 @@ Appendix: Proofs, Benchmark Defense, Hyperparameter Sensitivity, Visualizations
 
 ## 8. Quick Commands
 ```bash
-# Precompute teacher saliency (run once)
+# Precompute teacher saliency — SQuAD (primary, run once)
 python scripts/precompute_teacher_saliency.py \
-    --model_name Qwen/Qwen3-8B \
-    --data_source "databricks/databricks-dolly-15k" \
-    --output_path data/teacher_saliency.pt \
+    --model_name Qwen/Qwen3-8B --dataset squad \
+    --output_path data/teacher_saliency_squad.pt \
     --batch_size 4 --max_seq_len 512 --device cuda:0
 
-# Smoke test: baseline
+# Precompute teacher saliency — Dolly (secondary, run once)
+python scripts/precompute_teacher_saliency.py \
+    --model_name Qwen/Qwen3-8B --dataset dolly \
+    --output_path data/teacher_saliency_dolly.pt \
+    --batch_size 4 --max_seq_len 512 --device cuda:0
+
+# Smoke test: baseline on SQuAD
 python scripts/train.py \
-    --method standard_kd --epochs 1 --max_train_samples 200 \
+    --method standard_kd --dataset squad \
+    --epochs 1 --max_train_samples 200 \
     --device cuda:0 --skip_eval
 
-# Smoke test: SaGD
+# Smoke test: SaGD on SQuAD
 python scripts/train.py \
-    --method sagd \
-    --teacher_saliency_path data/teacher_saliency.pt \
+    --method sagd --dataset squad \
+    --teacher_saliency_path data/teacher_saliency_squad.pt \
     --lambda_sal 0.5 --sagd_every_n_steps 5 \
     --epochs 1 --max_train_samples 200 \
     --device cuda:0 --skip_eval
@@ -356,10 +401,11 @@ python scripts/train.py \
 # Unit tests
 pytest tests/ -v
 
-# Saliency diagnosis
+# Saliency diagnosis with evidence concentration (SQuAD)
 python scripts/diagnose_saliency.py \
     --student_ckpt outputs/standard_kd/seed_42/student_final.pt \
-    --teacher_saliency_path data/teacher_saliency.pt \
+    --teacher_saliency_path data/teacher_saliency_squad.pt \
+    --dataset squad \
     --output_path outputs/standard_kd/seed_42/saliency_diagnosis.json \
     --device cuda:0
 ```
@@ -375,6 +421,8 @@ python scripts/diagnose_saliency.py \
 - **Do not** mask saliency with only `(1 - labels_mask)` — must also multiply by `attention_mask`.
 - **Do not** skip the shift in KL/saliency mask — `logit[j]` predicts `token[j+1]`, use `labels_mask[:, 1:]`.
 - **Do not** let reweighting weights carry gradients — always `.detach()`.
-- **Do not** assume cache/training data alignment — verify same data_source, seed, max_seq_len, tokenizer, subset.
+- **Do not** assume cache/training data alignment — verify same data_source, dataset type, seed, max_seq_len, tokenizer, subset.
 - **Do not** use `compute()` for student saliency in the alignment loss — it returns detached tensors, making the loss term a no-op. Use `compute_differentiable()`.
-- **Do not** evaluate on training data — use subset="test" for ROUGE-L, subset="val" for diagnosis.
+- **Do not** evaluate on training data — use subset="test" for EM/F1/ROUGE-L, subset="val" for diagnosis.
+- **Do not** include unanswerable SQuAD samples — `SquadDataset` filters them out automatically.
+- **Do not** use a slow tokenizer with `SquadDataset` — `return_offsets_mapping=True` requires a fast tokenizer for answer span mapping.

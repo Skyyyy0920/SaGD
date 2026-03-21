@@ -13,7 +13,7 @@ import torch
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from sagd.data import InstructionDataset
+from sagd.data import InstructionDataset, SquadDataset
 from sagd.evaluation import evaluate_all
 from sagd.models import load_student, load_teacher
 from sagd.trainer import METHODS, Trainer
@@ -30,7 +30,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--student_model", type=str, default="Qwen/Qwen3-0.6B")
 
     # Data
-    p.add_argument("--data_source", type=str, default="databricks/databricks-dolly-15k")
+    p.add_argument("--dataset", type=str, default="dolly", choices=["dolly", "squad"],
+                    help="Dataset: 'dolly' (Dolly-15K) or 'squad' (SQuAD 2.0)")
+    p.add_argument("--data_source", type=str, default=None,
+                    help="HF dataset name. Auto-set from --dataset if not provided.")
     p.add_argument("--max_seq_len", type=int, default=512)
     p.add_argument("--max_train_samples", type=int, default=None)
     p.add_argument("--seed", type=int, default=42)
@@ -71,6 +74,13 @@ def main() -> None:
     if args.no_fp16:
         args.fp16 = False
 
+    # Auto-set data_source from --dataset if not explicitly provided
+    if args.data_source is None:
+        args.data_source = {
+            "dolly": "databricks/databricks-dolly-15k",
+            "squad": "rajpurkar/squad_v2",
+        }[args.dataset]
+
     # Reproducibility
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
@@ -80,6 +90,7 @@ def main() -> None:
     os.makedirs(save_dir, exist_ok=True)
 
     print(f"Method: {args.method}")
+    print(f"Dataset: {args.dataset} ({args.data_source})")
     print(f"Teacher: {args.teacher_model}")
     print(f"Student: {args.student_model}")
     print(f"Save dir: {save_dir}")
@@ -89,19 +100,31 @@ def main() -> None:
     student, s_tokenizer = load_student(args.student_model, args.device)
 
     # Use student tokenizer for data (student is the one being trained)
-    dataset = InstructionDataset(
-        tokenizer=s_tokenizer,
-        dataset_name=args.data_source,
-        max_seq_len=args.max_seq_len,
-        max_samples=args.max_train_samples,
-        seed=args.seed,
-        subset="train",
-    )
+    if args.dataset == "squad":
+        dataset = SquadDataset(
+            tokenizer=s_tokenizer,
+            dataset_name=args.data_source,
+            max_seq_len=args.max_seq_len,
+            max_samples=args.max_train_samples,
+            seed=args.seed,
+            subset="train",
+        )
+        print(f"Answer span mapping rate: {dataset.span_mapping_rate:.1%}")
+    else:
+        dataset = InstructionDataset(
+            tokenizer=s_tokenizer,
+            dataset_name=args.data_source,
+            max_seq_len=args.max_seq_len,
+            max_samples=args.max_train_samples,
+            seed=args.seed,
+            subset="train",
+        )
     print(f"Dataset size: {len(dataset)}")
 
     # Config dict
     config = {
         "method": args.method,
+        "dataset": args.dataset,
         "device": args.device,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
@@ -131,20 +154,34 @@ def main() -> None:
     # Evaluate
     if not args.skip_eval:
         print("Evaluating...")
-        eval_dataset = InstructionDataset(
-            tokenizer=s_tokenizer,
-            dataset_name=args.data_source,
-            max_seq_len=args.max_seq_len,
-            max_samples=500,
-            seed=args.seed,
-            subset="test",
-        )
+        if args.dataset == "squad":
+            eval_dataset = SquadDataset(
+                tokenizer=s_tokenizer,
+                dataset_name=args.data_source,
+                max_seq_len=args.max_seq_len,
+                max_samples=500,
+                seed=args.seed,
+                subset="test",
+            )
+        else:
+            eval_dataset = InstructionDataset(
+                tokenizer=s_tokenizer,
+                dataset_name=args.data_source,
+                max_seq_len=args.max_seq_len,
+                max_samples=500,
+                seed=args.seed,
+                subset="test",
+            )
         metrics = evaluate_all(
             student, s_tokenizer, eval_dataset,
             device=args.device,
             skip_bertscore=args.skip_bertscore,
+            dataset_type=args.dataset,
         )
         print(f"ROUGE-L F1:  {metrics['rouge_l_f']:.4f}")
+        if "exact_match" in metrics:
+            print(f"Exact Match: {metrics['exact_match']:.4f}")
+            print(f"Token F1:    {metrics['token_f1']:.4f}")
         if "bertscore_f" in metrics:
             print(f"BERTScore F1: {metrics['bertscore_f']:.4f}")
         print(f"Perplexity:  {metrics['perplexity']:.2f}")

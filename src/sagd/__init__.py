@@ -1,8 +1,10 @@
 """SaGD: Saliency-Guided Knowledge Distillation."""
 
-from sagd.data import InstructionDataset
+from sagd.data import InstructionDataset, SquadDataset
 from sagd.evaluation import (
     compute_bertscore,
+    compute_evidence_concentration,
+    compute_exact_match_f1,
     compute_perplexity,
     compute_rouge,
     evaluate_all,
@@ -15,6 +17,7 @@ from sagd.saliency import SaliencyAlignmentLoss, SaliencyComputer
 
 __all__ = [
     "InstructionDataset",
+    "SquadDataset",
     "StandardKDLoss",
     "ReverseKLLoss",
     "SaliencyComputer",
@@ -27,4 +30,6 @@ __all__ = [
     "compute_rouge",
     "compute_bertscore",
     "compute_perplexity",
+    "compute_exact_match_f1",
+    "compute_evidence_concentration",
 ]

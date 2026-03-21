@@ -113,7 +113,18 @@ class SaliencyComputer:
         embed.retain_grad()  # need grad on this intermediate tensor
 
         # 2. Forward through the full model
-        outputs = model(inputs_embeds=embed, attention_mask=attention_mask)
+        # CRITICAL: Disable efficient/flash SDPA backends — they don't support
+        # second-order gradients (create_graph=True). Only the math backend does.
+        # Use global flags (more reliable than context managers across PyTorch versions).
+        _flash_prev = torch.backends.cuda.flash_sdp_enabled()
+        _mem_prev = torch.backends.cuda.mem_efficient_sdp_enabled()
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        try:
+            outputs = model(inputs_embeds=embed, attention_mask=attention_mask)
+        finally:
+            torch.backends.cuda.enable_flash_sdp(_flash_prev)
+            torch.backends.cuda.enable_mem_efficient_sdp(_mem_prev)
         logits = outputs.logits  # (B, L, V)
 
         # 3. Response log-prob with shift alignment

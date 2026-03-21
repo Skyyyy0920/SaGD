@@ -20,7 +20,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from sagd.data import InstructionDataset
+from sagd.data import InstructionDataset, SquadDataset
 from sagd.evaluation import generate_responses, save_responses
 from sagd.models import load_student
 
@@ -30,7 +30,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--student_model", type=str, default="Qwen/Qwen3-0.6B")
     p.add_argument("--student_ckpt", type=str, required=True,
                     help="Path to student checkpoint (.pt)")
-    p.add_argument("--data_source", type=str, default="databricks/databricks-dolly-15k")
+    p.add_argument("--dataset", type=str, default="dolly", choices=["dolly", "squad"],
+                    help="Dataset: 'dolly' (Dolly-15K) or 'squad' (SQuAD 2.0)")
+    p.add_argument("--data_source", type=str, default=None,
+                    help="HF dataset name. Auto-set from --dataset if not provided.")
     p.add_argument("--max_seq_len", type=int, default=512)
     p.add_argument("--max_samples", type=int, default=500)
     p.add_argument("--max_new_tokens", type=int, default=256)
@@ -47,6 +50,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    if args.data_source is None:
+        args.data_source = {
+            "dolly": "databricks/databricks-dolly-15k",
+            "squad": "rajpurkar/squad_v2",
+        }[args.dataset]
+
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
@@ -57,14 +66,24 @@ def main() -> None:
     student.eval()
 
     # Dataset
-    dataset = InstructionDataset(
-        tokenizer=tokenizer,
-        dataset_name=args.data_source,
-        max_seq_len=args.max_seq_len,
-        max_samples=args.max_samples,
-        seed=args.seed,
-        subset=args.subset,
-    )
+    if args.dataset == "squad":
+        dataset = SquadDataset(
+            tokenizer=tokenizer,
+            dataset_name=args.data_source,
+            max_seq_len=args.max_seq_len,
+            max_samples=args.max_samples,
+            seed=args.seed,
+            subset=args.subset,
+        )
+    else:
+        dataset = InstructionDataset(
+            tokenizer=tokenizer,
+            dataset_name=args.data_source,
+            max_seq_len=args.max_seq_len,
+            max_samples=args.max_samples,
+            seed=args.seed,
+            subset=args.subset,
+        )
     print(f"Dataset: {len(dataset)} samples (subset={args.subset})")
 
     # Generate

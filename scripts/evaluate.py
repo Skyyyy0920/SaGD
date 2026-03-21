@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Standalone evaluation script for trained student models.
 
-Computes ROUGE-L, BERTScore (optional), and Perplexity.
+Computes ROUGE-L, BERTScore (optional), Perplexity, and for SQuAD: EM/F1.
 Optionally saves pre-generated responses to JSONL for later GPT-as-Judge use.
 """
 
@@ -16,7 +16,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from sagd.data import InstructionDataset
+from sagd.data import InstructionDataset, SquadDataset
 from sagd.evaluation import evaluate_all, generate_responses, save_responses
 from sagd.models import load_student
 
@@ -25,7 +25,10 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate student model")
     p.add_argument("--student_model", type=str, default="Qwen/Qwen3-0.6B")
     p.add_argument("--student_ckpt", type=str, required=True)
-    p.add_argument("--data_source", type=str, default="databricks/databricks-dolly-15k")
+    p.add_argument("--dataset", type=str, default="dolly", choices=["dolly", "squad"],
+                    help="Dataset: 'dolly' (Dolly-15K) or 'squad' (SQuAD 2.0)")
+    p.add_argument("--data_source", type=str, default=None,
+                    help="HF dataset name. Auto-set from --dataset if not provided.")
     p.add_argument("--max_seq_len", type=int, default=512)
     p.add_argument("--max_samples", type=int, default=500)
     p.add_argument("--max_new_tokens", type=int, default=256)
@@ -47,6 +50,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    if args.data_source is None:
+        args.data_source = {
+            "dolly": "databricks/databricks-dolly-15k",
+            "squad": "rajpurkar/squad_v2",
+        }[args.dataset]
+
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
@@ -55,14 +64,24 @@ def main() -> None:
     student.load_state_dict(state_dict)
     student.eval()
 
-    dataset = InstructionDataset(
-        tokenizer=tokenizer,
-        dataset_name=args.data_source,
-        max_seq_len=args.max_seq_len,
-        max_samples=args.max_samples,
-        seed=args.seed,
-        subset=args.subset,
-    )
+    if args.dataset == "squad":
+        dataset = SquadDataset(
+            tokenizer=tokenizer,
+            dataset_name=args.data_source,
+            max_seq_len=args.max_seq_len,
+            max_samples=args.max_samples,
+            seed=args.seed,
+            subset=args.subset,
+        )
+    else:
+        dataset = InstructionDataset(
+            tokenizer=tokenizer,
+            dataset_name=args.data_source,
+            max_seq_len=args.max_seq_len,
+            max_samples=args.max_samples,
+            seed=args.seed,
+            subset=args.subset,
+        )
 
     # Run all metrics
     metrics = evaluate_all(
@@ -72,9 +91,13 @@ def main() -> None:
         device=args.device,
         skip_bertscore=args.skip_bertscore,
         bertscore_model=args.bertscore_model,
+        dataset_type=args.dataset,
     )
 
     # Print results
+    if "exact_match" in metrics:
+        print(f"Exact Match:  {metrics['exact_match']:.4f}")
+        print(f"Token F1:     {metrics['token_f1']:.4f}")
     print(f"ROUGE-L F1:   {metrics['rouge_l_f']:.4f}")
     print(f"ROUGE-L P:    {metrics['rouge_l_p']:.4f}")
     print(f"ROUGE-L R:    {metrics['rouge_l_r']:.4f}")

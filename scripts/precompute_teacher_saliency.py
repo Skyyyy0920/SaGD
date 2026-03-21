@@ -4,7 +4,7 @@
 Run once before SaGD training. Output format:
 {
     "saliency": List[Tensor],  # each (L_i,) per sample
-    "metadata": {"model": str, "data": str, "n_samples": int, "max_seq_len": int}
+    "metadata": {"model": str, "data": str, "dataset": str, "n_samples": int, "max_seq_len": int}
 }
 """
 
@@ -19,7 +19,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from sagd.data import InstructionDataset, collate_fn
+from sagd.data import InstructionDataset, SquadDataset, collate_fn
 from sagd.models import load_teacher
 from sagd.saliency import SaliencyComputer
 
@@ -30,7 +30,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tokenizer_name", type=str, default=None,
                     help="Tokenizer to use. Defaults to --model_name. "
                          "For cross-arch experiments, set to the STUDENT model name.")
-    p.add_argument("--data_source", type=str, default="databricks/databricks-dolly-15k")
+    p.add_argument("--dataset", type=str, default="dolly", choices=["dolly", "squad"],
+                    help="Dataset: 'dolly' (Dolly-15K) or 'squad' (SQuAD 2.0)")
+    p.add_argument("--data_source", type=str, default=None,
+                    help="HF dataset name. Auto-set from --dataset if not provided.")
     p.add_argument("--output_path", type=str, default="data/teacher_saliency.pt")
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--max_seq_len", type=int, default=512)
@@ -43,11 +46,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    if args.data_source is None:
+        args.data_source = {
+            "dolly": "databricks/databricks-dolly-15k",
+            "squad": "rajpurkar/squad_v2",
+        }[args.dataset]
+
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
     print(f"Loading teacher: {args.model_name}")
-    tokenizer_name = args.tokenizer_name or args.model_name
     teacher, tokenizer = load_teacher(args.model_name, args.device)
 
     # If a different tokenizer is specified (cross-arch), use it for data
@@ -58,15 +66,25 @@ def main() -> None:
             tokenizer.pad_token = tokenizer.eos_token
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    dataset = InstructionDataset(
-        tokenizer=tokenizer,
-        dataset_name=args.data_source,
-        max_seq_len=args.max_seq_len,
-        max_samples=args.max_samples,
-        seed=args.seed,
-        subset="train",
-    )
-    print(f"Dataset size: {len(dataset)}")
+    if args.dataset == "squad":
+        dataset = SquadDataset(
+            tokenizer=tokenizer,
+            dataset_name=args.data_source,
+            max_seq_len=args.max_seq_len,
+            max_samples=args.max_samples,
+            seed=args.seed,
+            subset="train",
+        )
+    else:
+        dataset = InstructionDataset(
+            tokenizer=tokenizer,
+            dataset_name=args.data_source,
+            max_seq_len=args.max_seq_len,
+            max_samples=args.max_samples,
+            seed=args.seed,
+            subset="train",
+        )
+    print(f"Dataset: {args.dataset} ({args.data_source}), size: {len(dataset)}")
 
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn,
@@ -99,6 +117,7 @@ def main() -> None:
         "metadata": {
             "model": args.model_name,
             "data": args.data_source,
+            "dataset": args.dataset,
             "n_samples": len(dataset),
             "max_seq_len": args.max_seq_len,
         },

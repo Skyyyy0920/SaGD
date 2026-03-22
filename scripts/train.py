@@ -172,8 +172,10 @@ def main() -> None:
                 seed=args.seed,
                 subset="test",
             )
+        max_new = 32 if args.dataset == "squad" else 256
         metrics = evaluate_all(
             student, s_tokenizer, eval_dataset,
+            max_new_tokens=max_new,
             device=args.device,
             skip_bertscore=args.skip_bertscore,
             dataset_type=args.dataset,

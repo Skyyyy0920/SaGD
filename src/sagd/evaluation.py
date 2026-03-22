@@ -91,6 +91,9 @@ def generate_responses(
             for j, idx in enumerate(batch_indices):
                 gen_ids = outputs[j, max_prompt_len:]
                 generated = tokenizer.decode(gen_ids, skip_special_tokens=True)
+                # Strip to first line — extractive QA answers are short spans,
+                # but models often generate multi-line explanations after the answer.
+                generated = generated.split("\n")[0].strip()
                 results.append({
                     "index": idx,
                     "instruction": metas[j]["instruction"],

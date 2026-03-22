@@ -32,7 +32,8 @@ def _format_prompt(instruction: str, context: str) -> str:
 def _format_squad_prompt(context: str, question: str) -> str:
     """Format SQuAD sample into prompt string (without answer)."""
     return (
-        "Answer the question based on the context below.\n\n"
+        "Extract the answer to the question from the context. "
+        "Reply with only the exact answer, nothing else.\n\n"
         f"### Context:\n{context}\n\n"
         f"### Question:\n{question}\n\n"
         "### Answer:\n"

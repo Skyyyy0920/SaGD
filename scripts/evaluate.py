@@ -31,7 +31,8 @@ def parse_args() -> argparse.Namespace:
                     help="HF dataset name. Auto-set from --dataset if not provided.")
     p.add_argument("--max_seq_len", type=int, default=512)
     p.add_argument("--max_samples", type=int, default=500)
-    p.add_argument("--max_new_tokens", type=int, default=256)
+    p.add_argument("--max_new_tokens", type=int, default=None,
+                    help="Max tokens to generate. Default: 32 for squad, 256 for dolly.")
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--subset", type=str, default="test",
                     choices=["train", "val", "test"])
@@ -55,6 +56,9 @@ def main() -> None:
             "dolly": "databricks/databricks-dolly-15k",
             "squad": "rajpurkar/squad_v2",
         }[args.dataset]
+
+    if args.max_new_tokens is None:
+        args.max_new_tokens = 32 if args.dataset == "squad" else 256
 
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)

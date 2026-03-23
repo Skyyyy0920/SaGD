@@ -3,6 +3,10 @@
 
 For SQuAD datasets, also computes evidence concentration (fraction of
 saliency mass on the answer span) for both teacher and student.
+
+Teacher saliency is computed on-the-fly from the teacher model (not from
+the training cache) to avoid index misalignment when diagnosing on
+val/test subsets.
 """
 
 from __future__ import annotations
@@ -20,15 +24,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from sagd.data import InstructionDataset, SquadDataset, collate_fn
 from sagd.evaluation import compute_evidence_concentration
-from sagd.models import load_student
+from sagd.models import load_student, load_teacher
 from sagd.saliency import SaliencyComputer
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Saliency divergence diagnosis")
+    p.add_argument("--teacher_model", type=str, default="Qwen/Qwen3-8B")
     p.add_argument("--student_model", type=str, default="Qwen/Qwen3-0.6B")
     p.add_argument("--student_ckpt", type=str, required=True)
-    p.add_argument("--teacher_saliency_path", type=str, required=True)
     p.add_argument("--dataset", type=str, default="dolly", choices=["dolly", "squad"],
                     help="Dataset: 'dolly' (Dolly-15K) or 'squad' (SQuAD 2.0)")
     p.add_argument("--data_source", type=str, default=None,
@@ -56,17 +60,18 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
+    # Load teacher (for on-the-fly saliency computation)
+    print(f"Loading teacher: {args.teacher_model}")
+    teacher, _ = load_teacher(args.teacher_model, args.device)
+
     # Load student
+    print(f"Loading student: {args.student_model}")
     student, tokenizer = load_student(args.student_model, args.device)
     state_dict = torch.load(args.student_ckpt, map_location=args.device, weights_only=True)
     student.load_state_dict(state_dict)
     student.eval()
 
-    # Load teacher saliency cache
-    cache = torch.load(args.teacher_saliency_path, map_location="cpu", weights_only=False)
-    teacher_saliency_cache = cache["saliency"]
-
-    # Dataset
+    # Dataset (uses student tokenizer — same as training)
     if args.dataset == "squad":
         dataset = SquadDataset(
             tokenizer=tokenizer,
@@ -97,7 +102,7 @@ def main() -> None:
     all_teacher_ec: list[float] = []
     all_student_ec: list[float] = []
 
-    for batch in tqdm(dataloader, desc="Computing student saliency"):
+    for batch in tqdm(dataloader, desc="Computing saliency"):
         input_ids = batch["input_ids"].to(args.device)          # (B, L)
         attention_mask = batch["attention_mask"].to(args.device)  # (B, L)
         labels_mask = batch["labels_mask"].to(args.device)       # (B, L)
@@ -105,22 +110,17 @@ def main() -> None:
 
         seq_len = input_ids.size(1)
 
+        # Teacher saliency — computed on-the-fly (avoids cache/subset mismatch)
+        with torch.amp.autocast("cuda", enabled=False):
+            teacher_sal = computer.compute(
+                teacher, input_ids, attention_mask, labels_mask,
+            )  # (B, L)
+
         # Student saliency
         with torch.amp.autocast("cuda", enabled=False):
             student_sal = computer.compute(
                 student, input_ids, attention_mask, labels_mask,
             )  # (B, L)
-
-        # Teacher saliency from cache
-        teacher_sal_list = []
-        for idx in indices.tolist():
-            sal = teacher_saliency_cache[idx]  # (L_i,)
-            if sal.size(0) >= seq_len:
-                sal = sal[:seq_len]
-            else:
-                sal = torch.cat([sal, torch.zeros(seq_len - sal.size(0))])
-            teacher_sal_list.append(sal)
-        teacher_sal = torch.stack(teacher_sal_list).to(args.device)  # (B, L)
 
         # JSD
         jsd = computer.divergence(
@@ -136,31 +136,26 @@ def main() -> None:
             ans_start = batch["answer_token_start"].to(args.device)
             ans_end = batch["answer_token_end"].to(args.device)
 
-            t_ec = compute_evidence_concentration(
-                teacher_sal, ans_start, ans_end, attention_mask,
-            )
-            s_ec = compute_evidence_concentration(
-                student_sal, ans_start, ans_end, attention_mask,
-            )
-
             # Collect per-sample evidence concentrations for valid samples
             B = input_ids.size(0)
             for i in range(B):
-                if ans_start[i].item() >= 0 and ans_end[i].item() >= 0:
-                    t_total = teacher_sal[i].sum().item()
-                    s_total = student_sal[i].sum().item()
-                    if t_total > 1e-10:
-                        start_i = max(0, min(ans_start[i].item(), seq_len - 1))
-                        end_i = max(0, min(ans_end[i].item(), seq_len - 1))
-                        all_teacher_ec.append(
-                            teacher_sal[i, start_i:end_i + 1].sum().item() / t_total,
-                        )
-                    if s_total > 1e-10:
-                        start_i = max(0, min(ans_start[i].item(), seq_len - 1))
-                        end_i = max(0, min(ans_end[i].item(), seq_len - 1))
-                        all_student_ec.append(
-                            student_sal[i, start_i:end_i + 1].sum().item() / s_total,
-                        )
+                if ans_start[i].item() < 0 or ans_end[i].item() < 0:
+                    continue
+
+                start_i = max(0, min(ans_start[i].item(), seq_len - 1))
+                end_i = max(0, min(ans_end[i].item(), seq_len - 1))
+
+                t_total = teacher_sal[i].sum().item()
+                if t_total > 1e-10:
+                    all_teacher_ec.append(
+                        teacher_sal[i, start_i:end_i + 1].sum().item() / t_total,
+                    )
+
+                s_total = student_sal[i].sum().item()
+                if s_total > 1e-10:
+                    all_student_ec.append(
+                        student_sal[i, start_i:end_i + 1].sum().item() / s_total,
+                    )
 
     # Aggregate JSD
     jsd_values = [x[1] for x in all_jsd]
@@ -203,6 +198,7 @@ def main() -> None:
     if "teacher_evidence_concentration" in result:
         print(f"Teacher Evidence Concentration: {result['teacher_evidence_concentration']:.4f}")
         print(f"Student Evidence Concentration: {result['student_evidence_concentration']:.4f}")
+        print(f"EC samples: {result['n_ec_samples']}")
     print(f"Saved to {args.output_path}")
 
 

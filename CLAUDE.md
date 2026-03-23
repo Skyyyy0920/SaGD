@@ -402,9 +402,10 @@ python scripts/train.py \
 pytest tests/ -v
 
 # Saliency diagnosis with evidence concentration (SQuAD)
+# Teacher saliency is computed on-the-fly (no cache needed for diagnosis)
 python scripts/diagnose_saliency.py \
+    --teacher_model Qwen/Qwen3-8B \
     --student_ckpt outputs/standard_kd/seed_42/student_final.pt \
-    --teacher_saliency_path data/teacher_saliency_squad.pt \
     --dataset squad \
     --output_path outputs/standard_kd/seed_42/saliency_diagnosis.json \
     --device cuda:0

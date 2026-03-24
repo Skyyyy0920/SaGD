@@ -61,14 +61,24 @@ Since $\epsilon^1 \gg \epsilon^2 \gg \cdots$ for $\epsilon < 1$, first-order is 
 highest-ROI additional signal — higher-order terms decay rapidly.
 
 The full Jacobian $J \in \mathbb{R}^{V \times (L \cdot d)}$ is intractable for LLMs.
-**Input saliency** compresses it to a per-position scalar:
-$$s_i = \left\|\frac{\partial \log P(\text{response})}{\partial e_i}\right\|$$
-By Cauchy-Schwarz, $\|s_T - s_S\|^2 \leq \|J_T - J_S\|_F^2$ — saliency distance is a
-principled lower bound of Jacobian distance, not an arbitrary approximation.
+Instead of explicitly computing and aligning it, we use **noise-based implicit Jacobian
+matching** (Srinivas & Fleuret, ICML 2018):
+
+$$\mathbb{E}_\xi[D_\text{KL}(f_T(x+\xi) \| f_S(x+\xi))] = D_\text{KL}(f_T(x) \| f_S(x)) + \sigma^2 \|J_T(x) - J_S(x)\|_F^2 + O(\sigma^4)$$
+
+By computing KL on noise-perturbed embeddings, we implicitly match the **full Jacobian**
+without ever computing it. This is an exact equality (not a bound), and requires no
+second-order gradients, no flash attention workarounds.
+
+**Input saliency** $s_i = \|\partial \log P / \partial e_i\|$ is used separately for the
+**reweighting** component (not for the alignment loss). It compresses the Jacobian to
+per-position scalars for computing sample difficulty (JSD divergence).
 
 ### 2.2 Complete Loss
 
-$$\mathcal{L}_\text{SaGD} = \underbrace{\sum_{i=1}^B w_i \cdot D_\text{KL}(f_T(x_i) \| f_S(x_i))}_\text{weighted KL (zero-order + DRO)} + \lambda \cdot \underbrace{\frac{1}{B}\sum_{i=1}^B (1 - \cos(s_T^i, s_S^i))}_\text{saliency alignment loss (first-order)}$$
+$$\mathcal{L}_\text{SaGD} = \sum_{i=1}^B w_i \cdot \left[ \underbrace{D_\text{KL}(f_T(x_i) \| f_S(x_i))}_\text{clean KL (zero-order)} + \lambda \cdot \underbrace{D_\text{KL}(f_T(x_i + \xi_i) \| f_S(x_i + \xi_i))}_\text{noise KL (implicit first-order)} \right]$$
+
+where $\xi_i \sim \mathcal{N}(0, \sigma^2 I)$ is Gaussian noise on embeddings.
 
 Sample weights (mean-normalized to 1):
 $$w_i = \frac{\exp(\text{JSD}_i / \tau_w)}{\frac{1}{B}\sum_j \exp(\text{JSD}_j / \tau_w)}$$
@@ -76,17 +86,14 @@ $$w_i = \frac{\exp(\text{JSD}_i / \tau_w)}{\frac{1}{B}\sum_j \exp(\text{JSD}_j /
 where $\text{JSD}_i = \text{JSD}(\hat{s}_T^i, \hat{s}_S^i)$, $\hat{s} = \text{softmax}(s/\tau_s)$.
 
 **Two components and why both are needed**:
-- **Saliency alignment loss**: Directly shrinks the first-order gap → tightens neighborhood
-  error bounds for all samples. Uses cosine distance on raw (unnormalized) saliency vectors.
+- **Noise KL (implicit Jacobian matching)**: Adds Gaussian noise to embeddings and computes
+  KL on the perturbed input. Implicitly matches the full Jacobian $\|J_T - J_S\|_F^2$ —
+  no information loss, no second-order derivatives needed.
 - **Saliency-guided reweighting**: Concentrates zero-order (KL) optimization on samples where
   teacher/student attend to different input tokens. Corresponds to distributionally robust
   optimization (DRO) — prioritizing samples with the loosest neighborhood error bounds.
-- Neither alone achieves both effects.
-
-**Why cosine** (not KL or MSE):
-- KL requires softmax normalization → discards magnitude information.
-- MSE is sensitive to absolute scale differences between teacher/student (different model sizes).
-- Cosine captures "which positions matter" independent of scale.
+- Neither alone achieves both effects: noise KL tightens bounds uniformly, reweighting
+  allocates more training budget to the worst-case samples.
 
 ### 2.3 Saliency Computation
 
@@ -115,14 +122,16 @@ For a sample with `input_ids`, `attention_mask`, `labels_mask` (0=prompt, 1=resp
 ```
 
 **Teacher saliency** is precomputed once (teacher is frozen) and cached to disk.
-**Student saliency** is computed every N training steps.
+**Student saliency** is computed every N training steps (for reweighting only).
 
-**Differentiable vs non-differentiable saliency**:
-- `compute()`: Non-differentiable. Used for teacher precomputation, diagnosis, and
-  reweighting signal. Returns detached tensor. No gradients flow to model parameters.
-- `compute_differentiable()`: Differentiable via `torch.autograd.grad(create_graph=True)`.
-  Used ONLY for student saliency in the alignment loss path. Returns tensor with gradient
-  graph intact so that sal_loss.backward() propagates to student parameters.
+Saliency is used ONLY for the reweighting component (computing JSD to determine sample
+weights). The first-order matching is handled by noise KL, not by saliency alignment.
+
+`compute()`: Non-differentiable. Used for teacher precomputation, diagnosis, and
+reweighting signal. Returns detached tensor. No gradients flow to model parameters.
+
+`compute_differentiable()`: Retained for research/analysis but NOT used in training.
+The noise KL approach replaces the need for differentiable saliency.
 
 ### 2.4 Per-Sample KL
 
@@ -137,8 +146,8 @@ For a sample with `input_ids`, `attention_mask`, `labels_mask` (0=prompt, 1=resp
 ### 2.5 Training Flow
 
 ```
-Pre-training (once, ~1h):
-  precompute_teacher_saliency.py → data/teacher_saliency.pt
+Pre-training (once):
+  precompute_teacher_saliency.py → data/teacher_saliency_squad.pt
 
 Each training step:
   1. Load batch (input_ids, attention_mask, labels_mask, index)
@@ -147,16 +156,19 @@ Each training step:
 
   if method == "sagd" AND global_step % N == 0:
     4. per_sample_kl = compute_per_sample_kl(t_logits, s_logits, labels_mask)
-    5. student_sal = saliency_computer.compute(student, ...)
-    6. teacher_sal = get_cached_teacher_saliency(batch["index"])
-    7. sal_loss = saliency_alignment_loss(teacher_sal, student_sal, labels_mask)
-    8. jsd = saliency_divergence(teacher_sal, student_sal, labels_mask)
-    9. weights = softmax(jsd / τ_w) * B   # mean=1
-    10. loss = (weights.detach() * per_sample_kl).mean() + λ * sal_loss
+    5. noisy_embed = student_embed + N(0, σ²I)
+    6. Teacher forward on noisy_embed → t_logits_noisy  (under torch.no_grad)
+    7. Student forward on noisy_embed → s_logits_noisy
+    8. per_sample_kl_noisy = compute_per_sample_kl(t_logits_noisy, s_logits_noisy, ...)
+    9. student_sal = saliency_computer.compute(student, ...)  [non-differentiable]
+    10. teacher_sal = get_cached_teacher_saliency(batch["index"])
+    11. jsd = saliency_divergence(teacher_sal, student_sal, labels_mask)
+    12. weights = softmax(jsd / τ_w) * B   # mean=1
+    13. loss = (weights.detach() * (per_sample_kl + λ * per_sample_kl_noisy)).mean()
   else:
-    10. loss = standard_kl_loss(t_logits, s_logits, labels_mask)
+    13. loss = standard_kl_loss(t_logits, s_logits, labels_mask)
 
-  11. loss.backward() → optimizer.step()
+  14. loss.backward() → optimizer.step()
 ```
 
 ### 2.6 Teacher Saliency Cache Format
@@ -239,18 +251,19 @@ METHODS = {
 
 | Parameter | Symbol | Default | Sensitivity | Sweep |
 |-----------|--------|---------|-------------|-------|
-| Saliency loss weight | λ | 0.5 | High | [0.01, 0.1, 0.5, 1.0, 2.0] |
+| Noise KL weight | λ | 0.5 | High | [0.1, 0.5, 1.0, 2.0, 5.0] |
+| Noise std | σ | 0.01 | High | [0.001, 0.005, 0.01, 0.02, 0.05] |
 | Reweighting temperature | τ_w | 1.0 | High | [0.1, 0.5, 1.0, 2.0, 5.0] |
 | Saliency normalization temp | τ_s | 2.0 | Low | — |
-| Saliency update frequency | N | 5 | Medium | [1, 3, 5, 10, 20] |
+| SaGD step frequency | N | 5 | Medium | [1, 3, 5, 10, 20] |
 
 ### Ablation configs
 
-| Name | λ | τ_w | Effect |
-|------|---|-----|--------|
-| `sagd` | 0.5 | 1.0 | Full method |
-| `sagd_loss_only` | 0.5 | 100.0 | τ_w≈∞ → uniform weights → only saliency loss |
-| `sagd_reweight_only` | 0.0 | 1.0 | No saliency loss → only reweighting |
+| Name | λ | σ | τ_w | Effect |
+|------|---|---|-----|--------|
+| `sagd` | 0.5 | 0.01 | 1.0 | Full method |
+| `sagd_noise_only` | 0.5 | 0.01 | 100.0 | τ_w≈∞ → uniform weights → only noise KL |
+| `sagd_reweight_only` | 0.0 | — | 1.0 | No noise KL → only reweighting |
 
 ---
 
@@ -306,10 +319,12 @@ Teacher stays in `eval()` with `torch.no_grad()` throughout. Never modified.
 When method is not `sagd`, zero SaGD components are initialized. Baselines run
 identically as if SaGD code did not exist.
 
-### 5.10 Saliency alignment loss requires differentiable saliency
-The alignment loss must use `compute_differentiable()` for the student. Using `compute()`
-(which returns detached tensors) makes the loss a constant that does not affect training.
-This is a critical correctness requirement.
+### 5.10 Noise KL uses detached embeddings with noise
+The noisy embedding is created from `student.get_input_embeddings()(input_ids)` under
+`torch.no_grad()`, then noise is added. The student forward on `noisy_embed` IS
+differentiable (gradients flow through the model layers), but the embedding lookup itself
+is detached. This is correct: the noise must be fixed (not optimized away), while the
+model's response to the noisy input must be differentiable for training.
 
 ---
 
@@ -326,7 +341,7 @@ This is a critical correctness requirement.
 | Srinivas & Fleuret (ICML 2018) | Jacobian matching ≈ Gaussian noise | CNN | Complementary theory; we add saliency compression + reweighting |
 | Ballout et al. (2024) | Teacher saliency → top-K rationale text | T5 QA | Uses saliency for data augmentation, not as loss or reweighting |
 
-**SaGD's novelty**: (1) decoder-only LLM instruction distillation, (2) saliency-based sample reweighting (no prior work uses attribution divergence for this), (3) cosine alignment (not KL/MSE), (4) loss + reweighting dual channel, (5) Sobolev/Taylor + DRO theoretical framework.
+**SaGD's novelty**: (1) noise-based implicit Jacobian matching for decoder-only LLM distillation (Srinivas theory applied to new domain), (2) saliency-based sample reweighting (no prior work uses attribution divergence for this), (3) noise KL + reweighting dual channel, (4) Sobolev/Taylor + DRO theoretical framework, (5) evidence concentration metric for validating saliency alignment.
 
 ---
 
@@ -394,7 +409,7 @@ python scripts/train.py \
 python scripts/train.py \
     --method sagd --dataset squad \
     --teacher_saliency_path data/teacher_saliency_squad.pt \
-    --lambda_sal 0.5 --sagd_every_n_steps 5 \
+    --lambda_noise 0.5 --noise_sigma 0.01 --sagd_every_n_steps 5 \
     --epochs 1 --max_train_samples 200 \
     --device cuda:0 --skip_eval
 
@@ -423,7 +438,7 @@ python scripts/diagnose_saliency.py \
 - **Do not** skip the shift in KL/saliency mask — `logit[j]` predicts `token[j+1]`, use `labels_mask[:, 1:]`.
 - **Do not** let reweighting weights carry gradients — always `.detach()`.
 - **Do not** assume cache/training data alignment — verify same data_source, dataset type, seed, max_seq_len, tokenizer, subset.
-- **Do not** use `compute()` for student saliency in the alignment loss — it returns detached tensors, making the loss term a no-op. Use `compute_differentiable()`.
+- **Do not** let noise be differentiable w.r.t. the model — embeddings must be detached before adding noise, otherwise the model can learn to cancel the noise.
 - **Do not** evaluate on training data — use subset="test" for EM/F1/ROUGE-L, subset="val" for diagnosis.
 - **Do not** include unanswerable SQuAD samples — `SquadDataset` filters them out automatically.
 - **Do not** use a slow tokenizer with `SquadDataset` — `return_offsets_mapping=True` requires a fast tokenizer for answer span mapping.

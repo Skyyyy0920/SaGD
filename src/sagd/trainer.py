@@ -2,6 +2,10 @@
 
 Supports three methods: standard_kd, reverse_kl, sagd.
 See CLAUDE.md §2.5 for the complete training flow pseudocode.
+
+SaGD uses noise KL for implicit Jacobian matching (Srinivas & Fleuret 2018):
+  E[KL(f_T(x+ξ) || f_S(x+ξ))] = KL(f_T(x) || f_S(x)) + σ² ||J_T - J_S||²_F + O(σ⁴)
+Combined with saliency-guided sample reweighting (DRO).
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ from tqdm import tqdm
 
 from sagd.data import InstructionDataset, collate_fn
 from sagd.losses import ReverseKLLoss, StandardKDLoss
-from sagd.saliency import SaliencyAlignmentLoss, SaliencyComputer
+from sagd.saliency import SaliencyComputer
 
 METHODS = {"standard_kd", "reverse_kl", "sagd"}
 
@@ -74,14 +78,13 @@ class Trainer:
 
         # SaGD components — only initialized when method == "sagd"
         self.saliency_computer: SaliencyComputer | None = None
-        self.sal_align_loss: SaliencyAlignmentLoss | None = None
         self.teacher_saliency_cache: list[torch.Tensor] | None = None
 
         if method == "sagd":
             sal_temp = config.get("saliency_temperature", 2.0)
             self.saliency_computer = SaliencyComputer(temperature=sal_temp)
-            self.sal_align_loss = SaliencyAlignmentLoss()
-            self.lambda_sal = config.get("lambda_sal", 0.5)
+            self.lambda_noise = config.get("lambda_noise", 0.5)
+            self.noise_sigma = config.get("noise_sigma", 0.01)
             self.sagd_every_n = config.get("sagd_every_n_steps", 5)
             self.sagd_tau_w = config.get("sagd_tau_w", 1.0)
 
@@ -139,6 +142,55 @@ class Trainer:
                 sal = torch.cat([sal, pad])
             batch_sal.append(sal)
         return torch.stack(batch_sal).to(device)  # (B, seq_len)
+
+    def _compute_noisy_kl(
+        self,
+        input_ids: torch.Tensor,      # (B, L)
+        attention_mask: torch.Tensor,  # (B, L)
+        labels_mask: torch.Tensor,     # (B, L)
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Compute per-sample KL on noise-perturbed embeddings.
+
+        Adds Gaussian noise to student embeddings, runs both teacher and student
+        on the perturbed input, computes per-sample KL. This implicitly matches
+        the full Jacobian: E[KL(f_T(x+ξ)||f_S(x+ξ))] ≈ KL + σ²||J_T-J_S||²_F.
+
+        Returns:
+            per_sample_kl_noisy: (B,) — per-sample KL on noisy input.
+            stats: dict with noise diagnostics.
+        """
+        # Get student embeddings and add noise
+        with torch.no_grad():
+            embed = self.student.get_input_embeddings()(input_ids)  # (B, L, d)
+            embed_norm = embed.norm(dim=-1, keepdim=True).mean().item()
+
+        noise = torch.randn_like(embed) * self.noise_sigma  # (B, L, d)
+        noisy_embed = embed + noise  # (B, L, d) — detached, used as input
+
+        # Teacher forward on noisy input (frozen, no_grad)
+        with torch.no_grad():
+            t_out_noisy = self.teacher(
+                inputs_embeds=noisy_embed, attention_mask=attention_mask,
+            )
+            t_logits_noisy = t_out_noisy.logits.float()  # (B, L, V)
+
+        # Student forward on noisy input (differentiable)
+        s_out_noisy = self.student(
+            inputs_embeds=noisy_embed, attention_mask=attention_mask,
+        )
+        s_logits_noisy = s_out_noisy.logits.float()  # (B, L, V)
+
+        # Per-sample KL on noisy logits
+        per_sample_kl_noisy = self._compute_per_sample_kl(
+            t_logits_noisy, s_logits_noisy, labels_mask,
+        )  # (B,)
+
+        stats = {
+            "embed_norm": embed_norm,
+            "noise_ratio": self.noise_sigma / max(embed_norm, 1e-8),
+        }
+
+        return per_sample_kl_noisy, stats
 
     def train(self, save_dir: str) -> dict[str, list[float]]:
         """Run training loop.
@@ -200,14 +252,21 @@ class Trainer:
                     step_stats: dict[str, Any] = {"step": global_step, "epoch": epoch}
 
                     if self.method == "sagd" and global_step % self.sagd_every_n == 0:
-                        # SaGD step
+                        # === SaGD step ===
+
+                        # 1. Per-sample KL on clean input
                         per_sample_kl = self._compute_per_sample_kl(
                             t_logits, s_logits, labels_mask,
                         )  # (B,)
 
-                        # NON-differentiable student saliency — for reweighting only
+                        # 2. Per-sample KL on noisy input (implicit Jacobian matching)
+                        per_sample_kl_noisy, noise_stats = self._compute_noisy_kl(
+                            input_ids, attention_mask, labels_mask,
+                        )  # (B,)
+
+                        # 3. Saliency-guided reweighting (NON-differentiable)
                         with torch.no_grad():
-                            student_sal_for_reweight = self.saliency_computer.compute(
+                            student_sal = self.saliency_computer.compute(
                                 self.student, input_ids, attention_mask, labels_mask,
                             )  # (B, L), detached
 
@@ -215,31 +274,24 @@ class Trainer:
                             indices, input_ids.size(1), input_ids.device,
                         )  # (B, L)
 
-                        # Reweighting: uses NON-differentiable saliency
                         jsd = self.saliency_computer.divergence(
-                            teacher_sal, student_sal_for_reweight, labels_mask, attention_mask,
+                            teacher_sal, student_sal, labels_mask, attention_mask,
                         )  # (B,)
                         weights = F.softmax(jsd / self.sagd_tau_w, dim=0) * jsd.size(0)  # (B,)
 
-                        # DIFFERENTIABLE student saliency — for alignment loss
-                        with torch.amp.autocast("cuda", enabled=False):
-                            student_sal_for_loss = self.saliency_computer.compute_differentiable(
-                                self.student, input_ids, attention_mask, labels_mask,
-                            )  # (B, L), differentiable!
-
-                        sal_loss, sal_stats = self.sal_align_loss(
-                            teacher_sal, student_sal_for_loss, labels_mask, attention_mask,
-                        )
-
-                        loss = (weights.detach() * per_sample_kl).mean() + \
-                               self.lambda_sal * sal_loss
+                        # 4. Combined loss: weighted (clean KL + λ * noisy KL)
+                        loss = (weights.detach() * (
+                            per_sample_kl + self.lambda_noise * per_sample_kl_noisy
+                        )).mean()
 
                         step_stats.update({
-                            "sagd/sal_loss": sal_loss.item(),
+                            "sagd/kl_noisy": per_sample_kl_noisy.mean().item(),
+                            "sagd/kl_clean": per_sample_kl.mean().item(),
                             "sagd/mean_jsd": jsd.mean().item(),
                             "sagd/max_weight": weights.max().item(),
                             "sagd/min_weight": weights.min().item(),
-                            "sagd/mean_cos_sim": sal_stats["mean_cos_sim"],
+                            "sagd/embed_norm": noise_stats["embed_norm"],
+                            "sagd/noise_ratio": noise_stats["noise_ratio"],
                         })
                     else:
                         # Standard or non-SaGD-step

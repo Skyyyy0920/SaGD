@@ -121,7 +121,8 @@ class TestTrainer:
                 "fp16": False,
                 "log_every": 1,
                 "teacher_saliency_path": cache_path,
-                "lambda_sal": 0.5,
+                "lambda_noise": 0.5,
+                "noise_sigma": 0.01,
                 "sagd_every_n_steps": 2,
                 "sagd_tau_w": 1.0,
                 "saliency_temperature": 2.0,
@@ -154,7 +155,8 @@ class TestTrainer:
                 "fp16": False,
                 "log_every": 1,
                 "teacher_saliency_path": cache_path,
-                "lambda_sal": 0.5,
+                "lambda_noise": 0.5,
+                "noise_sigma": 0.01,
                 "sagd_every_n_steps": 1,  # Every step for testing
                 "sagd_tau_w": 1.0,
                 "saliency_temperature": 2.0,
@@ -175,8 +177,9 @@ class TestTrainer:
             sagd_logged = False
             for line in lines:
                 entry = json.loads(line)
-                if "sagd/sal_loss" in entry:
+                if "sagd/kl_noisy" in entry:
                     sagd_logged = True
+                    assert "sagd/kl_clean" in entry
                     assert "sagd/mean_jsd" in entry
                     assert "sagd/max_weight" in entry
                     assert "sagd/min_weight" in entry
@@ -205,5 +208,4 @@ class TestTrainer:
             teacher_model, student_model, tiny_tokenizer, tiny_dataset, config,
         )
         assert trainer.saliency_computer is None
-        assert trainer.sal_align_loss is None
         assert trainer.teacher_saliency_cache is None

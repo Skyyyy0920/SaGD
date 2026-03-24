@@ -21,7 +21,8 @@ fp16: true
 
 # SaGD
 teacher_saliency_path: "data/teacher_saliency_squad.pt"
-lambda_sal: 0.5
+lambda_noise: 0.5
+noise_sigma: 0.01
 sagd_every_n_steps: 5
 sagd_tau_w: 1.0
 saliency_temperature: 2.0

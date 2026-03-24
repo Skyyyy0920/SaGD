@@ -52,7 +52,10 @@ def parse_args() -> argparse.Namespace:
 
     # SaGD-specific
     p.add_argument("--teacher_saliency_path", type=str, default=None)
-    p.add_argument("--lambda_sal", type=float, default=0.5)
+    p.add_argument("--lambda_noise", type=float, default=0.5,
+                    help="Weight for noise KL loss (implicit Jacobian matching)")
+    p.add_argument("--noise_sigma", type=float, default=0.01,
+                    help="Std of Gaussian noise added to embeddings")
     p.add_argument("--sagd_every_n_steps", type=int, default=5)
     p.add_argument("--sagd_tau_w", type=float, default=1.0)
     p.add_argument("--saliency_temperature", type=float, default=2.0)
@@ -137,7 +140,8 @@ def main() -> None:
         "fp16": args.fp16,
         "log_every": args.log_every,
         "teacher_saliency_path": args.teacher_saliency_path,
-        "lambda_sal": args.lambda_sal,
+        "lambda_noise": args.lambda_noise,
+        "noise_sigma": args.noise_sigma,
         "sagd_every_n_steps": args.sagd_every_n_steps,
         "sagd_tau_w": args.sagd_tau_w,
         "saliency_temperature": args.saliency_temperature,

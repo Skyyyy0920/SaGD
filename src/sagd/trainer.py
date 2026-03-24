@@ -151,32 +151,38 @@ class Trainer:
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Compute per-sample KL on noise-perturbed embeddings.
 
-        Adds Gaussian noise to student embeddings, runs both teacher and student
-        on the perturbed input, computes per-sample KL. This implicitly matches
-        the full Jacobian: E[KL(f_T(x+ξ)||f_S(x+ξ))] ≈ KL + σ²||J_T-J_S||²_F.
+        Adds Gaussian noise to each model's own embeddings (supports different
+        hidden dimensions for cross-architecture distillation), then computes
+        per-sample KL. This implicitly matches the full Jacobian:
+        E[KL(f_T(x+ξ)||f_S(x+ξ))] ≈ KL + σ²||J_T-J_S||²_F.
 
         Returns:
             per_sample_kl_noisy: (B,) — per-sample KL on noisy input.
             stats: dict with noise diagnostics.
         """
-        # Get student embeddings and add noise
+        # Each model uses its own embedding + independent noise
+        # (necessary when teacher and student have different hidden dims)
         with torch.no_grad():
-            embed = self.student.get_input_embeddings()(input_ids)  # (B, L, d)
-            embed_norm = embed.norm(dim=-1, keepdim=True).mean().item()
+            t_embed = self.teacher.get_input_embeddings()(input_ids)  # (B, L, d_t)
+            t_noise = torch.randn_like(t_embed) * self.noise_sigma
+            t_noisy_embed = t_embed + t_noise
 
-        noise = torch.randn_like(embed) * self.noise_sigma  # (B, L, d)
-        noisy_embed = embed + noise  # (B, L, d) — detached, used as input
+            s_embed = self.student.get_input_embeddings()(input_ids)  # (B, L, d_s)
+            s_embed_norm = s_embed.norm(dim=-1).mean().item()
+
+        s_noise = torch.randn_like(s_embed) * self.noise_sigma  # (B, L, d_s)
+        s_noisy_embed = s_embed + s_noise  # detached base + noise
 
         # Teacher forward on noisy input (frozen, no_grad)
         with torch.no_grad():
             t_out_noisy = self.teacher(
-                inputs_embeds=noisy_embed, attention_mask=attention_mask,
+                inputs_embeds=t_noisy_embed, attention_mask=attention_mask,
             )
             t_logits_noisy = t_out_noisy.logits.float()  # (B, L, V)
 
-        # Student forward on noisy input (differentiable)
+        # Student forward on noisy input (differentiable through model layers)
         s_out_noisy = self.student(
-            inputs_embeds=noisy_embed, attention_mask=attention_mask,
+            inputs_embeds=s_noisy_embed, attention_mask=attention_mask,
         )
         s_logits_noisy = s_out_noisy.logits.float()  # (B, L, V)
 
@@ -186,8 +192,8 @@ class Trainer:
         )  # (B,)
 
         stats = {
-            "embed_norm": embed_norm,
-            "noise_ratio": self.noise_sigma / max(embed_norm, 1e-8),
+            "embed_norm": s_embed_norm,
+            "noise_ratio": self.noise_sigma / max(s_embed_norm, 1e-8),
         }
 
         return per_sample_kl_noisy, stats

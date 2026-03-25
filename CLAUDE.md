@@ -74,11 +74,19 @@ second-order gradients, no flash attention workarounds.
 **reweighting** component (not for the alignment loss). It compresses the Jacobian to
 per-position scalars for computing sample difficulty (JSD divergence).
 
+**Saliency also guides position-adaptive noise**: instead of uniform $\sigma$ across
+all positions, noise is scaled proportionally to $|s_{T,j} - s_{S,j}|$ — positions
+where teacher and student disagree most get more perturbation. Under a fixed noise
+budget $\sum_j \sigma_j^2 = C$, this allocation is optimal for minimizing the Jacobian
+gap (Lagrange multiplier argument on the per-position Jacobian terms).
+
 ### 2.2 Complete Loss
 
 $$\mathcal{L}_\text{SaGD} = \sum_{i=1}^B w_i \cdot \left[ \underbrace{D_\text{KL}(f_T(x_i) \| f_S(x_i))}_\text{clean KL (zero-order)} + \lambda \cdot \underbrace{D_\text{KL}(f_T(x_i + \xi_i) \| f_S(x_i + \xi_i))}_\text{noise KL (implicit first-order)} \right]$$
 
-where $\xi_i \sim \mathcal{N}(0, \sigma^2 I)$ is Gaussian noise on embeddings.
+where $\xi_{i,j} \sim \mathcal{N}(0, \sigma_j^2 I)$ with position-adaptive noise:
+$$\sigma_j = \sigma \cdot \frac{|s_{T,j} - s_{S,j}|}{\overline{|s_T - s_S|}}$$
+Mean-normalized so average noise magnitude equals $\sigma$.
 
 Sample weights (mean-normalized to 1):
 $$w_i = \frac{\exp(\text{JSD}_i / \tau_w)}{\frac{1}{B}\sum_j \exp(\text{JSD}_j / \tau_w)}$$

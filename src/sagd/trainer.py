@@ -148,6 +148,8 @@ class Trainer:
         input_ids: torch.Tensor,      # (B, L)
         attention_mask: torch.Tensor,  # (B, L)
         labels_mask: torch.Tensor,     # (B, L)
+        teacher_sal: torch.Tensor | None = None,  # (B, L) for adaptive noise
+        student_sal: torch.Tensor | None = None,  # (B, L) for adaptive noise
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Compute per-sample KL on noise-perturbed embeddings.
 
@@ -156,21 +158,42 @@ class Trainer:
         per-sample KL. This implicitly matches the full Jacobian:
         E[KL(f_T(x+ξ)||f_S(x+ξ))] ≈ KL + σ²||J_T-J_S||²_F.
 
+        When teacher_sal and student_sal are provided, uses position-adaptive
+        noise: σ_j ∝ |s_T,j - s_S,j|, allocating more noise to positions
+        where saliency diverges. This is optimal under fixed noise budget
+        (see CLAUDE.md §2.2 Adaptive Noise).
+
         Returns:
             per_sample_kl_noisy: (B,) — per-sample KL on noisy input.
             stats: dict with noise diagnostics.
         """
+        # Compute per-position noise scale
+        if teacher_sal is not None and student_sal is not None:
+            # Adaptive noise: σ_j ∝ |s_T,j - s_S,j|, normalized to mean = noise_sigma
+            sal_diff = (teacher_sal - student_sal).abs()  # (B, L)
+            sal_diff_mean = sal_diff.mean(dim=-1, keepdim=True).clamp(min=1e-8)  # (B, 1)
+            noise_scale = sal_diff / sal_diff_mean * self.noise_sigma  # (B, L), mean ≈ σ
+        else:
+            noise_scale = self.noise_sigma  # scalar, uniform noise
+
         # Each model uses its own embedding + independent noise
         # (necessary when teacher and student have different hidden dims)
         with torch.no_grad():
             t_embed = self.teacher.get_input_embeddings()(input_ids)  # (B, L, d_t)
-            t_noise = torch.randn_like(t_embed) * self.noise_sigma
+            if isinstance(noise_scale, torch.Tensor):
+                # Adaptive: expand (B, L) → (B, L, 1) for broadcasting with (B, L, d_t)
+                t_noise = torch.randn_like(t_embed) * noise_scale.unsqueeze(-1)
+            else:
+                t_noise = torch.randn_like(t_embed) * noise_scale
             t_noisy_embed = t_embed + t_noise
 
             s_embed = self.student.get_input_embeddings()(input_ids)  # (B, L, d_s)
             s_embed_norm = s_embed.norm(dim=-1).mean().item()
 
-        s_noise = torch.randn_like(s_embed) * self.noise_sigma  # (B, L, d_s)
+        if isinstance(noise_scale, torch.Tensor):
+            s_noise = torch.randn_like(s_embed) * noise_scale.unsqueeze(-1)
+        else:
+            s_noise = torch.randn_like(s_embed) * noise_scale
         s_noisy_embed = s_embed + s_noise  # detached base + noise
 
         # Teacher forward on noisy input (frozen, no_grad)
@@ -194,6 +217,7 @@ class Trainer:
         stats = {
             "embed_norm": s_embed_norm,
             "noise_ratio": self.noise_sigma / max(s_embed_norm, 1e-8),
+            "adaptive_noise": teacher_sal is not None,
         }
 
         return per_sample_kl_noisy, stats
@@ -265,12 +289,7 @@ class Trainer:
                             t_logits, s_logits, labels_mask,
                         )  # (B,)
 
-                        # 2. Per-sample KL on noisy input (implicit Jacobian matching)
-                        per_sample_kl_noisy, noise_stats = self._compute_noisy_kl(
-                            input_ids, attention_mask, labels_mask,
-                        )  # (B,)
-
-                        # 3. Saliency-guided reweighting (NON-differentiable)
+                        # 2. Saliency for reweighting AND adaptive noise
                         with torch.no_grad():
                             student_sal = self.saliency_computer.compute(
                                 self.student, input_ids, attention_mask, labels_mask,
@@ -280,12 +299,20 @@ class Trainer:
                             indices, input_ids.size(1), input_ids.device,
                         )  # (B, L)
 
+                        # 3. Per-sample KL on noisy input (implicit Jacobian matching)
+                        #    Uses saliency difference for position-adaptive noise
+                        per_sample_kl_noisy, noise_stats = self._compute_noisy_kl(
+                            input_ids, attention_mask, labels_mask,
+                            teacher_sal=teacher_sal, student_sal=student_sal,
+                        )  # (B,)
+
+                        # 4. Saliency-guided reweighting (DRO)
                         jsd = self.saliency_computer.divergence(
                             teacher_sal, student_sal, labels_mask, attention_mask,
                         )  # (B,)
                         weights = F.softmax(jsd / self.sagd_tau_w, dim=0) * jsd.size(0)  # (B,)
 
-                        # 4. Combined loss: weighted (clean KL + λ * noisy KL)
+                        # 5. Combined loss: weighted (clean KL + λ * noisy KL)
                         loss = (weights.detach() * (
                             per_sample_kl + self.lambda_noise * per_sample_kl_noisy
                         )).mean()

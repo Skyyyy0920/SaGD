@@ -70,6 +70,31 @@ By computing KL on noise-perturbed embeddings, we implicitly match the **full Ja
 without ever computing it. This is an exact equality (not a bound), and requires no
 second-order gradients, no flash attention workarounds.
 
+**Extension to autoregressive KL** (our contribution, extends Srinivas from classification):
+
+For sequence-level KL $D(x) = \sum_{t \in \mathcal{R}} D_t(x)$ where
+$D_t = \sum_v p_T^v(x,t) \log(p_T^v / p_S^v)$, Taylor expansion gives:
+
+$$\mathbb{E}_\xi[D(x+\xi)] = D(x) + \frac{\sigma^2}{2}\sum_t \left[\mathcal{F}_t(x) + R_t(x)\right] + O(\sigma^4)$$
+
+where $\mathcal{F}_t(x) = \sum_v p_T^v \|\nabla_x \log p_T^v - \nabla_x \log p_S^v\|^2$
+is the **Fisher-weighted score matching** term (dominant, captures Jacobian difference),
+and $R_t(x) = \sum_v \Delta p_T^v(1+\ell_v) - \sum_v (p_T^v/p_S^v)\Delta p_S^v$ is a
+residual satisfying $R_t = O(\|p_T - p_S\|)$ (vanishes as distillation converges).
+
+Derivation: Leibniz rule on $D_t = \sum_v p_T^v \ell_v$ gives
+$\Delta D_t = \sum_v [p_T^v \Delta\ell_v + 2\nabla p_T^v \cdot \nabla\ell_v + \ell_v \Delta p_T^v]$.
+The cross term $2\nabla p_T^v \cdot \nabla\ell_v$ plus part of $p_T^v \Delta\ell_v$ combine
+into the perfect square $\mathcal{F}_t$; remaining terms form $R_t$.
+
+**Neighborhood guarantee** (Theorem): For $\lambda \geq \epsilon^2/\sigma^2$ and $\sigma \geq \epsilon$:
+
+$$\max_i \sup_{\|\delta\| \leq \epsilon} D(x_i+\delta) \leq \max_i \left[D(x_i) + \lambda \mathbb{E}_\xi[D(x_i+\xi)]\right] + O(\epsilon^3)$$
+
+Standard KD ($\lambda=0$): $D(x_i) \to 0$ does not control neighborhood error.
+SaGD ($\lambda>0$): loss $\to 0$ requires both $D \to 0$ and $\mathbb{E}_\xi[D(x+\xi)] \to 0$,
+the latter implying $\Delta D \to 0$ via the expansion, thus controlling neighborhood error.
+
 **Input saliency** $s_i = \|\partial \log P / \partial e_i\|$ is used separately for the
 **reweighting** component (not for the alignment loss). It compresses the Jacobian to
 per-position scalars for computing sample difficulty (JSD divergence).
@@ -84,6 +109,12 @@ Sample weights (mean-normalized to 1):
 $$w_i = \frac{\exp(\text{JSD}_i / \tau_w)}{\frac{1}{B}\sum_j \exp(\text{JSD}_j / \tau_w)}$$
 
 where $\text{JSD}_i = \text{JSD}(\hat{s}_T^i, \hat{s}_S^i)$, $\hat{s} = \text{softmax}(s/\tau_s)$.
+
+Reweighting is derived from entropy-regularized minimax on sample vulnerability
+$c_i = D(x_i) + \frac{\epsilon^2}{2}\sum_t \mathcal{F}_t(x_i)$: minimizing worst-case
+neighborhood error with entropy regularization yields $w_i^* = \text{softmax}(c_i/\tau_w)$.
+JSD is used as a computationally tractable proxy for $c_i$ (not an equivalence).
+$\tau_w$ controls DRO strength: $\tau_w \to 0$ = hard example mining, $\tau_w \to \infty$ = uniform.
 
 **Two components and why both are needed**:
 - **Noise KL (implicit Jacobian matching)**: Adds Gaussian noise to embeddings and computes

@@ -99,18 +99,18 @@ the latter implying $\Delta D \to 0$ via the expansion, thus controlling neighbo
 **reweighting** component (not for the alignment loss). It compresses the Jacobian to
 per-position scalars for computing sample difficulty (JSD divergence).
 
-Saliency also guides **position-adaptive noise** allocation: $\sigma_j \propto |s_{T,j} - s_{S,j}|$,
+Saliency also guides **position-adaptive noise** allocation:
+$\sigma_j = \sigma \cdot \max(|s_{T,j} - s_{S,j}|, \delta) / \overline{\max(|s_T - s_S|, \delta)}$,
 concentrating perturbation where teacher/student disagree most. Under minimax optimality
 on the per-position Jacobian gap (with linear gap-reduction approximation), this is the
-optimal allocation for a fixed total noise budget. See Direction 3 in the theory.
+optimal allocation for a fixed total noise budget. The $\delta$ floor ensures every
+position receives some noise even when saliency is perfectly aligned.
 
 ### 2.2 Complete Loss
 
 $$\mathcal{L}_\text{SaGD} = \sum_{i=1}^B w_i \cdot \left[ \underbrace{D_\text{KL}(f_T(x_i) \| f_S(x_i))}_\text{clean KL (zero-order)} + \lambda \cdot \underbrace{D_\text{KL}(f_T(x_i + \xi_i) \| f_S(x_i + \xi_i))}_\text{noise KL (implicit first-order)} \right]$$
 
-where $\xi_{i,j} \sim \mathcal{N}(0, \sigma_j^2 I)$ with position-adaptive noise:
-$$\sigma_j = \sigma \cdot \frac{|s_{T,j} - s_{S,j}|}{\overline{|s_T - s_S|}}$$
-Mean-normalized so average noise magnitude equals $\sigma$.
+where $\xi_i \sim \mathcal{N}(0, \sigma^2 I)$ is Gaussian noise on embeddings.
 
 Sample weights (mean-normalized to 1):
 $$w_i = \frac{\exp(\text{JSD}_i / \tau_w)}{\frac{1}{B}\sum_j \exp(\text{JSD}_j / \tau_w)}$$
@@ -196,18 +196,21 @@ Each training step:
     4. per_sample_kl = compute_per_sample_kl(t_logits, s_logits, labels_mask)
     5. student_sal = saliency_computer.compute(student, ...)  [non-differentiable]
     6. teacher_sal = get_cached_teacher_saliency(batch["index"])
-    7. Generate position-adaptive noise: σ_j ∝ |s_T,j - s_S,j|
-    8. noisy_embed = student_embed + noise(σ_j)
-    9. Teacher forward on noisy_embed → t_logits_noisy  (under torch.no_grad)
-    10. Student forward on noisy_embed → s_logits_noisy
-    11. per_sample_kl_noisy = compute_per_sample_kl(t_logits_noisy, s_logits_noisy, ...)
-    12. jsd = saliency_divergence(teacher_sal, student_sal, labels_mask)
-    13. weights = softmax(jsd / τ_w) * B   # mean=1
-    14. loss = (weights.detach() * (per_sample_kl + λ * per_sample_kl_noisy)).mean()
+    7. Generate position-adaptive noise: σ_j ∝ max(|s_T,j - s_S,j|, δ)
+    8. t_embed = teacher.get_input_embeddings()(input_ids)  [detached, under no_grad]
+       s_embed = student.get_input_embeddings()(input_ids)  [detached, under no_grad]
+    9. t_noisy = t_embed + adaptive_noise(t_embed, σ_j)
+       s_noisy = s_embed + adaptive_noise(s_embed, σ_j)
+    10. Teacher forward on t_noisy → t_logits_noisy  (under torch.no_grad)
+    11. Student forward on s_noisy → s_logits_noisy  (differentiable through layers)
+    12. per_sample_kl_noisy = compute_per_sample_kl(t_logits_noisy, s_logits_noisy, ...)
+    13. jsd = saliency_divergence(teacher_sal, student_sal, labels_mask)
+    14. weights = softmax(jsd / τ_w) * B   # mean=1
+    15. loss = (weights.detach() * (per_sample_kl + λ * per_sample_kl_noisy)).mean()
   else:
-    14. loss = standard_kl_loss(t_logits, s_logits, labels_mask)
+    15. loss = standard_kl_loss(t_logits, s_logits, labels_mask)
 
-  15. loss.backward() → optimizer.step()
+  16. loss.backward() → optimizer.step()
 ```
 
 ### 2.6 Teacher Saliency Cache Format
@@ -232,13 +235,14 @@ what fraction of saliency mass falls on the answer span tokens:
 evidence_concentration_i = sum(saliency[answer_start : answer_end + 1]) / sum(saliency)
 ```
 
-- Teacher's EC should be high (teacher "looks at" the evidence)
-- SaGD student's EC should approach teacher's EC
-- Standard KD student's EC should be lower (doesn't preserve where to look)
+- Teacher's EC is moderate-low (teacher distributes saliency across full context for holistic reasoning)
+- Standard KD student's EC is high (over-concentrates on answer span — shortcut learning)
+- SaGD student's EC should approach teacher's EC (preserves holistic reasoning pattern)
 
-This directly validates the core claim: SaGD teaches students WHERE to look, not just
-WHAT to output. Unlike Mean JSD (which measures distribution divergence), EC has
-ground-truth: the answer span IS the evidence the model should attend to.
+EC measures whether the student preserves the teacher's reasoning pattern.
+The goal is NOT "high EC" but "EC close to teacher". Standard KD students learn
+shortcuts (over-focusing on answer tokens), while SaGD preserves the teacher's
+broader context utilization.
 
 Answer span token mapping: `SquadDataset` maps character offsets from SQuAD annotations
 to token positions using `return_offsets_mapping=True` from the fast tokenizer.
@@ -247,11 +251,11 @@ excluded from EC computation.
 
 ### 2.8 Ablation Theory Correspondence
 
-| Config | KL (zero-order) | Sal loss (first-order) | Reweight | Theoretical space |
+| Config | KL (zero-order) | Noise KL (first-order) | Reweight | Theoretical space |
 |--------|-----------------|------------------------|----------|-------------------|
 | Standard KD | uniform | — | — | L² |
-| + Sal loss only | uniform | ✓ | — | W^{1,2} |
-| + Reweight only | weighted | — | ✓ | L² + DRO |
+| + Noise KL only | uniform | ✓ (λ>0, τ_w=∞) | — | W^{1,2} |
+| + Reweight only | weighted | — (λ=0) | ✓ | L² + DRO |
 | **SaGD (full)** | weighted | ✓ | ✓ | W^{1,2} + DRO |
 
 ---

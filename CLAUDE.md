@@ -99,11 +99,18 @@ the latter implying $\Delta D \to 0$ via the expansion, thus controlling neighbo
 **reweighting** component (not for the alignment loss). It compresses the Jacobian to
 per-position scalars for computing sample difficulty (JSD divergence).
 
+Saliency also guides **position-adaptive noise** allocation: $\sigma_j \propto |s_{T,j} - s_{S,j}|$,
+concentrating perturbation where teacher/student disagree most. Under minimax optimality
+on the per-position Jacobian gap (with linear gap-reduction approximation), this is the
+optimal allocation for a fixed total noise budget. See Direction 3 in the theory.
+
 ### 2.2 Complete Loss
 
 $$\mathcal{L}_\text{SaGD} = \sum_{i=1}^B w_i \cdot \left[ \underbrace{D_\text{KL}(f_T(x_i) \| f_S(x_i))}_\text{clean KL (zero-order)} + \lambda \cdot \underbrace{D_\text{KL}(f_T(x_i + \xi_i) \| f_S(x_i + \xi_i))}_\text{noise KL (implicit first-order)} \right]$$
 
-where $\xi_i \sim \mathcal{N}(0, \sigma^2 I)$ is Gaussian noise on embeddings.
+where $\xi_{i,j} \sim \mathcal{N}(0, \sigma_j^2 I)$ with position-adaptive noise:
+$$\sigma_j = \sigma \cdot \frac{|s_{T,j} - s_{S,j}|}{\overline{|s_T - s_S|}}$$
+Mean-normalized so average noise magnitude equals $\sigma$.
 
 Sample weights (mean-normalized to 1):
 $$w_i = \frac{\exp(\text{JSD}_i / \tau_w)}{\frac{1}{B}\sum_j \exp(\text{JSD}_j / \tau_w)}$$
@@ -187,19 +194,20 @@ Each training step:
 
   if method == "sagd" AND global_step % N == 0:
     4. per_sample_kl = compute_per_sample_kl(t_logits, s_logits, labels_mask)
-    5. noisy_embed = student_embed + N(0, σ²I)
-    6. Teacher forward on noisy_embed → t_logits_noisy  (under torch.no_grad)
-    7. Student forward on noisy_embed → s_logits_noisy
-    8. per_sample_kl_noisy = compute_per_sample_kl(t_logits_noisy, s_logits_noisy, ...)
-    9. student_sal = saliency_computer.compute(student, ...)  [non-differentiable]
-    10. teacher_sal = get_cached_teacher_saliency(batch["index"])
-    11. jsd = saliency_divergence(teacher_sal, student_sal, labels_mask)
-    12. weights = softmax(jsd / τ_w) * B   # mean=1
-    13. loss = (weights.detach() * (per_sample_kl + λ * per_sample_kl_noisy)).mean()
+    5. student_sal = saliency_computer.compute(student, ...)  [non-differentiable]
+    6. teacher_sal = get_cached_teacher_saliency(batch["index"])
+    7. Generate position-adaptive noise: σ_j ∝ |s_T,j - s_S,j|
+    8. noisy_embed = student_embed + noise(σ_j)
+    9. Teacher forward on noisy_embed → t_logits_noisy  (under torch.no_grad)
+    10. Student forward on noisy_embed → s_logits_noisy
+    11. per_sample_kl_noisy = compute_per_sample_kl(t_logits_noisy, s_logits_noisy, ...)
+    12. jsd = saliency_divergence(teacher_sal, student_sal, labels_mask)
+    13. weights = softmax(jsd / τ_w) * B   # mean=1
+    14. loss = (weights.detach() * (per_sample_kl + λ * per_sample_kl_noisy)).mean()
   else:
-    13. loss = standard_kl_loss(t_logits, s_logits, labels_mask)
+    14. loss = standard_kl_loss(t_logits, s_logits, labels_mask)
 
-  14. loss.backward() → optimizer.step()
+  15. loss.backward() → optimizer.step()
 ```
 
 ### 2.6 Teacher Saliency Cache Format

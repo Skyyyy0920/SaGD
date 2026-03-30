@@ -70,7 +70,9 @@ By computing KL on noise-perturbed embeddings, we implicitly match the **full Ja
 without ever computing it. This is an exact equality (not a bound), and requires no
 second-order gradients, no flash attention workarounds.
 
-**Extension to autoregressive KL** (our contribution, extends Srinivas from classification):
+**Note**: The equality above was proven by Srinivas for MSE loss on classification tasks.
+For **autoregressive token-level KL** (our setting), we derive an analogous but
+non-identical result with an additional residual term:
 
 For sequence-level KL $D(x) = \sum_{t \in \mathcal{R}} D_t(x)$ where
 $D_t = \sum_v p_T^v(x,t) \log(p_T^v / p_S^v)$, Taylor expansion gives:
@@ -196,11 +198,11 @@ Each training step:
     4. per_sample_kl = compute_per_sample_kl(t_logits, s_logits, labels_mask)
     5. student_sal = saliency_computer.compute(student, ...)  [non-differentiable]
     6. teacher_sal = get_cached_teacher_saliency(batch["index"])
-    7. Generate position-adaptive noise: σ_j ∝ max(|s_T,j - s_S,j|, δ)
-    8. t_embed = teacher.get_input_embeddings()(input_ids)  [detached, under no_grad]
-       s_embed = student.get_input_embeddings()(input_ids)  [detached, under no_grad]
-    9. t_noisy = t_embed + adaptive_noise(t_embed, σ_j)
-       s_noisy = s_embed + adaptive_noise(s_embed, σ_j)
+    7. Compute shared per-position noise scale: σ_j ∝ max(|s_T,j - s_S,j|, δ)
+    8. t_embed = teacher.get_input_embeddings()(input_ids).detach()
+       s_embed = student.get_input_embeddings()(input_ids).detach()
+    9. t_noisy = t_embed + randn_like(t_embed) * σ_j   [same σ_j, independent z]
+       s_noisy = s_embed + randn_like(s_embed) * σ_j   [same σ_j, independent z]
     10. Teacher forward on t_noisy → t_logits_noisy  (under torch.no_grad)
     11. Student forward on s_noisy → s_logits_noisy  (differentiable through layers)
     12. per_sample_kl_noisy = compute_per_sample_kl(t_logits_noisy, s_logits_noisy, ...)
@@ -238,6 +240,9 @@ evidence_concentration_i = sum(saliency[answer_start : answer_end + 1]) / sum(sa
 - Teacher's EC is moderate-low (teacher distributes saliency across full context for holistic reasoning)
 - Standard KD student's EC is high (over-concentrates on answer span — shortcut learning)
 - SaGD student's EC should approach teacher's EC (preserves holistic reasoning pattern)
+
+Empirically verified (seed=42, Qwen3-8B→0.6B, SQuAD val):
+  Teacher EC: 0.055, Standard KD EC: 0.169, SaGD EC: 0.083
 
 EC measures whether the student preserves the teacher's reasoning pattern.
 The goal is NOT "high EC" but "EC close to teacher". Standard KD students learn

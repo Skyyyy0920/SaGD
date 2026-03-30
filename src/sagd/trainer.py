@@ -143,32 +143,23 @@ class Trainer:
             batch_sal.append(sal)
         return torch.stack(batch_sal).to(device)  # (B, seq_len)
 
-    def _generate_adaptive_noise(
+    def _compute_adaptive_sigma(
         self,
-        embed: torch.Tensor,           # (B, L, d)
         teacher_sal: torch.Tensor,     # (B, L)
         student_sal: torch.Tensor,     # (B, L)
     ) -> torch.Tensor:
-        """Generate position-adaptive Gaussian noise.
+        """Compute per-position noise scale from saliency difference.
 
-        Positions where teacher/student saliency diverges most receive more
-        noise. Under minimax optimality (see CLAUDE.md §2.1), this allocation
-        minimizes worst-case residual Jacobian gap for a fixed noise budget.
-
-        The per-position sigma is:
-            σ_j = σ_base * max(|s_T,j - s_S,j|, δ) / mean(max(|s_T - s_S|, δ))
+        σ_j = σ_base * max(|s_T,j - s_S,j|, δ) / mean(max(|s_T - s_S|, δ))
         Mean-normalized so average noise magnitude equals σ_base.
 
         Returns:
-            noise: (B, L, d) — position-adaptive Gaussian noise.
+            sigma_per_pos: (B, L)
         """
         sal_diff = (teacher_sal - student_sal).abs()  # (B, L)
         sal_diff = sal_diff.clamp(min=1e-6)
         sal_diff_mean = sal_diff.mean(dim=-1, keepdim=True).clamp(min=1e-8)  # (B, 1)
-        sigma_per_pos = self.noise_sigma * sal_diff / sal_diff_mean  # (B, L)
-
-        noise = torch.randn_like(embed) * sigma_per_pos.unsqueeze(-1)  # (B, L, d)
-        return noise
+        return self.noise_sigma * sal_diff / sal_diff_mean  # (B, L)
 
     def _compute_noisy_kl(
         self,
@@ -180,24 +171,29 @@ class Trainer:
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Compute per-sample KL on noise-perturbed embeddings.
 
-        Uses position-adaptive noise scaled by saliency difference.
-        Each model uses its own embeddings (supports different hidden dims
-        for cross-architecture distillation).
+        Both models see the "same" perturbation: shared per-position noise
+        scale σ_j (from saliency difference), applied to each model's own
+        embeddings. For cross-architecture (different d_t, d_s), the noise
+        is generated independently per dimension but with the same σ_j scale,
+        preserving the Jacobian matching interpretation.
 
         Returns:
             per_sample_kl_noisy: (B,) — per-sample KL on noisy input.
             stats: dict with noise diagnostics.
         """
+        # Shared per-position noise scale
+        sigma_per_pos = self._compute_adaptive_sigma(
+            teacher_sal, student_sal,
+        )  # (B, L)
+
         with torch.no_grad():
             t_embed = self.teacher.get_input_embeddings()(input_ids)  # (B, L, d_t)
-            t_noise = self._generate_adaptive_noise(t_embed, teacher_sal, student_sal)
-            t_noisy_embed = t_embed + t_noise
+            t_noisy_embed = t_embed + torch.randn_like(t_embed) * sigma_per_pos.unsqueeze(-1)
 
             s_embed = self.student.get_input_embeddings()(input_ids)  # (B, L, d_s)
             s_embed_norm = s_embed.norm(dim=-1).mean().item()
 
-        s_noise = self._generate_adaptive_noise(s_embed, teacher_sal, student_sal)
-        s_noisy_embed = s_embed + s_noise  # detached base + noise
+        s_noisy_embed = s_embed + torch.randn_like(s_embed) * sigma_per_pos.unsqueeze(-1)
 
         # Teacher forward on noisy input (frozen, no_grad)
         with torch.no_grad():

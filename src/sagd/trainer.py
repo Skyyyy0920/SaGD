@@ -147,12 +147,12 @@ class Trainer:
         self,
         teacher_sal: torch.Tensor,     # (B, L)
         student_sal: torch.Tensor,     # (B, L)
+        embed_norm: float,             # mean embedding norm for this batch
     ) -> torch.Tensor:
         """Compute per-position noise scale from saliency difference.
 
-        σ_j = σ_base * clamp(max(|s_T,j - s_S,j|, δ) / mean(...), max=5)
-        Mean-normalized so average noise magnitude ≈ σ_base.
-        Clamped to [δ, 5×σ_base] to prevent extreme values that cause NaN.
+        noise_sigma is interpreted as a FRACTION of embedding norm (not absolute).
+        σ_j = σ_base * embed_norm * clamp(sal_diff_j / mean(sal_diff), max=5)
 
         Returns:
             sigma_per_pos: (B, L)
@@ -161,7 +161,8 @@ class Trainer:
         sal_diff = sal_diff.clamp(min=1e-6)
         sal_diff_mean = sal_diff.mean(dim=-1, keepdim=True).clamp(min=1e-8)  # (B, 1)
         ratio = (sal_diff / sal_diff_mean).clamp(max=5.0)  # cap at 5× mean
-        return self.noise_sigma * ratio  # (B, L)
+        # noise_sigma is relative to embed_norm (e.g., 0.01 = 1% of embedding)
+        return self.noise_sigma * embed_norm * ratio  # (B, L)
 
     def _compute_noisy_kl(
         self,
@@ -183,17 +184,19 @@ class Trainer:
             per_sample_kl_noisy: (B,) — per-sample KL on noisy input.
             stats: dict with noise diagnostics.
         """
-        # Shared per-position noise scale
+        # Get embeddings first to compute norm for relative noise scaling
+        with torch.no_grad():
+            t_embed = self.teacher.get_input_embeddings()(input_ids)  # (B, L, d_t)
+            s_embed = self.student.get_input_embeddings()(input_ids)  # (B, L, d_s)
+            s_embed_norm = s_embed.norm(dim=-1).mean().item()
+
+        # Shared per-position noise scale (relative to embedding norm)
         sigma_per_pos = self._compute_adaptive_sigma(
-            teacher_sal, student_sal,
+            teacher_sal, student_sal, s_embed_norm,
         )  # (B, L)
 
         with torch.no_grad():
-            t_embed = self.teacher.get_input_embeddings()(input_ids)  # (B, L, d_t)
             t_noisy_embed = t_embed + torch.randn_like(t_embed) * sigma_per_pos.unsqueeze(-1)
-
-            s_embed = self.student.get_input_embeddings()(input_ids)  # (B, L, d_s)
-            s_embed_norm = s_embed.norm(dim=-1).mean().item()
 
         s_noisy_embed = s_embed + torch.randn_like(s_embed) * sigma_per_pos.unsqueeze(-1)
 
@@ -215,9 +218,14 @@ class Trainer:
             t_logits_noisy, s_logits_noisy, labels_mask,
         )  # (B,)
 
+        # NaN guard: replace NaN with 0 (skip noise KL for corrupted samples)
+        nan_mask = torch.isnan(per_sample_kl_noisy)
+        if nan_mask.any():
+            per_sample_kl_noisy = per_sample_kl_noisy.masked_fill(nan_mask, 0.0)
+
         stats = {
             "embed_norm": s_embed_norm,
-            "noise_ratio": self.noise_sigma / max(s_embed_norm, 1e-8),
+            "noise_ratio": self.noise_sigma,  # now relative, so this IS the ratio
         }
 
         return per_sample_kl_noisy, stats

@@ -102,11 +102,13 @@ the latter implying $\Delta D \to 0$ via the expansion, thus controlling neighbo
 per-position scalars for computing sample difficulty (JSD divergence).
 
 Saliency also guides **position-adaptive noise** allocation:
-$\sigma_j = \sigma \cdot \max(|s_{T,j} - s_{S,j}|, \delta) / \overline{\max(|s_T - s_S|, \delta)}$,
+$\sigma_j = \sigma \cdot \|e\| \cdot \max(|s_{T,j} - s_{S,j}|, \delta) / \overline{\max(|s_T - s_S|, \delta)}$,
+where $\sigma$ is a **relative** parameter (fraction of embedding norm $\|e\|$),
 concentrating perturbation where teacher/student disagree most. Under minimax optimality
 on the per-position Jacobian gap (with linear gap-reduction approximation), this is the
 optimal allocation for a fixed total noise budget. The $\delta$ floor ensures every
-position receives some noise even when saliency is perfectly aligned.
+position receives some noise even when saliency is perfectly aligned. The adaptive ratio
+is clamped to [δ, 5×] to prevent numerical instability.
 
 ### 2.2 Complete Loss
 
@@ -300,7 +302,7 @@ METHODS = {
 | Parameter | Symbol | Default | Sensitivity | Sweep |
 |-----------|--------|---------|-------------|-------|
 | Noise KL weight | λ | 0.5 | High | [0.1, 0.5, 1.0, 2.0, 5.0] |
-| Noise std | σ | 0.01 | High | [0.001, 0.005, 0.01, 0.02, 0.05] |
+| Noise std (relative) | σ | 0.01 | High | [0.001, 0.005, 0.01, 0.02, 0.05] |
 | Reweighting temperature | τ_w | 1.0 | High | [0.1, 0.5, 1.0, 2.0, 5.0] |
 | Saliency normalization temp | τ_s | 2.0 | Low | — |
 | SaGD step frequency | N | 5 | Medium | [1, 3, 5, 10, 20] |

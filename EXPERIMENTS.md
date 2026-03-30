@@ -2,84 +2,83 @@
 
 本文档对应论文 §4 的全部实验。按顺序执行，后续实验依赖前序实验的输出。
 
-**方法概要**: SaGD = 噪声 KL（隐式 Jacobian 匹配）+ Saliency-guided reweighting（DRO）。
+**方法概要**: SaGD = 噪声 KL（隐式 Jacobian 匹配，position-adaptive）+ Saliency-guided reweighting（DRO）。
 超参：`--lambda_noise`（噪声 KL 权重）、`--noise_sigma`（噪声幅度）、`--sagd_tau_w`（DRO 温度）。
+
+**已有 seed=42 单种子结果（Standard KD baseline）**:
+- EM: 0.316, Token F1: 0.506, ROUGE-L: 0.497, PPL: 2.48
+- Mean JSD: 0.330, Teacher EC: 0.055, Student EC: 0.169
 
 ---
 
 ## 总览
 
 ```
-Phase 0   预计算 teacher saliency (SQuAD + Dolly)   1 GPU    ~3h
-Phase 1   Exp 1: Saliency 诊断（动机实验）            1 GPU    ~1h     → §4.2
-Phase 2   Exp 2: 主实验表 SQuAD（3方法 × 3种子）       4 GPU    ~6h     → §4.3
-Phase 3   Exp 3: Evidence Concentration 分析          1 GPU    ~1h     → §4.4
-Phase 4   Exp 4: 消融实验（~15 runs）                  4 GPU    ~8h     → §4.5
+Phase 0   预计算 teacher saliency (SQuAD + Dolly)   1 GPU    ~3h      前置条件
+Phase 1   Exp 1: Saliency 诊断（动机实验）            1 GPU    ~2h     → §4.2
+Phase 2   Exp 2: 主实验表 SQuAD（3方法 × 3种子）       4 GPU    ~9h     → §4.3
+Phase 3   Exp 3: Evidence Concentration 分析          —       ~0h     → §4.4（从 Phase 2 提取）
+Phase 4   Exp 4: 消融实验（~9 runs + sweeps）          4 GPU    ~12h    → §4.5
 Phase 5   Exp 5: 训练动态曲线                          1 GPU    ~2h     → §4.6
 Phase 6   Exp 6: Dolly 泛化验证                        4 GPU    ~6h     → §4.7
-Phase 7   Exp 7: 跨架构泛化（LLaMA）                   1 GPU    ~4h     → §4.8
+Phase 7   Exp 7: 跨架构泛化（LLaMA）                   4 GPU    ~8h     → §4.8
 Phase 8   Exp 8: Benchmark 防御（MMLU 等）             1 GPU    ~2h     → Appendix
 ```
 
-**硬件**: 4× A100 80GB（Phase 2,4,6 可并行；其他 phase 单卡即可）
+**硬件**: 4× A100 80GB（利用多卡并行加速）
 **固定超参**: epochs=3, batch_size=8, grad_accum=4, lr=2e-5, max_seq_len=512, T=2.0, fp16=true
 **种子**: 42, 123, 456
+**SaGD 默认超参**: λ=0.5, σ=0.1, τ_w=1.0, N=5
 
 ---
 
 ## Phase 0: 预计算 Teacher Saliency（运行一次）
 
-**目的**: Teacher 是冻结的，saliency 只需算一次，缓存到磁盘。用于 SaGD 训练时的 reweighting。
+**目的**: Teacher 是冻结的，saliency 只需算一次，缓存到磁盘。用于 SaGD 训练时的 reweighting + adaptive noise。
 
 **关键**: 必须与训练使用完全相同的 dataset, data_source, seed, max_seq_len, tokenizer, subset。
 
-### SQuAD（主实验）
-
 ```bash
+# SQuAD（主实验）— 并行跑两个
 python scripts/precompute_teacher_saliency.py \
-    --model_name Qwen/Qwen3-8B \
-    --dataset squad \
+    --model_name Qwen/Qwen3-8B --dataset squad \
     --output_path data/teacher_saliency_squad.pt \
-    --batch_size 4 --max_seq_len 512 --device cuda:0
-```
+    --batch_size 4 --max_seq_len 512 --device cuda:0 &
 
-**输出**: `data/teacher_saliency_squad.pt`（~86K 样本）
-**耗时**: ~2 小时
-
-### Dolly（泛化实验）
-
-```bash
+# Dolly（泛化实验）
 python scripts/precompute_teacher_saliency.py \
-    --model_name Qwen/Qwen3-8B \
-    --dataset dolly \
+    --model_name Qwen/Qwen3-8B --dataset dolly \
     --output_path data/teacher_saliency_dolly.pt \
-    --batch_size 4 --max_seq_len 512 --device cuda:0
+    --batch_size 4 --max_seq_len 512 --device cuda:1 &
+
+wait
 ```
 
-**输出**: `data/teacher_saliency_dolly.pt`（~14K 样本）
-**耗时**: ~1 小时
+**输出**: `data/teacher_saliency_squad.pt`（~86K），`data/teacher_saliency_dolly.pt`（~14K）
 
 ---
 
 ## Phase 1: Exp 1 — Saliency Divergence 诊断（§4.2）
 
 **论文问题**: "Standard KD 是否保留了 teacher 的 saliency 模式？"
-**预期结论**: 不保留。Standard KD student 与 teacher 存在显著的 saliency 偏差。
 
-### Step 1.1: 训练 Standard KD baseline（SQuAD）
+### Step 1.1: 训练 Standard KD baseline（3 种子并行）
 
 ```bash
-for SEED in 42 123 456; do
+for i in 0 1 2; do
+    SEED=(42 123 456)
+    GPU=$i
     python scripts/train.py \
         --method standard_kd --dataset squad \
-        --seed $SEED --output_dir outputs/ \
-        --device cuda:0
+        --seed ${SEED[$i]} --output_dir outputs/ \
+        --device cuda:$GPU &
 done
+wait
 ```
 
 ### Step 1.2: Saliency 诊断 + Evidence Concentration
 
-> **注意**: `diagnose_saliency.py` 现在**直接加载 teacher 模型**现算 saliency（不从 train cache 读取），避免 train/val 索引不匹配。
+> **注意**: `diagnose_saliency.py` 直接加载 teacher 模型现算 saliency（不从 train cache 读取），避免 train/val 索引不匹配。需要约 15GB 显存。
 
 ```bash
 for SEED in 42 123 456; do
@@ -92,19 +91,7 @@ for SEED in 42 123 456; do
 done
 ```
 
-**输出**: 每个种子一个 JSON，包含:
-```json
-{
-    "mean_jsd": 0.xxx,
-    "std_jsd": 0.xxx,
-    "teacher_evidence_concentration": 0.xxx,
-    "student_evidence_concentration": 0.xxx,
-    "n_ec_samples": 497,
-    "top20_samples": [...]
-}
-```
-
-### Step 1.3（可选）: 未训练 student 的诊断
+### Step 1.3: 未训练 student 的诊断（baseline）
 
 ```bash
 python -c "
@@ -125,47 +112,42 @@ python scripts/diagnose_saliency.py \
 
 | Model | Mean JSD ↓ | Teacher EC | Student EC |
 |-------|-----------|------------|------------|
-| Pretrained (no KD) | 较高 | x.xx | x.xx |
-| Standard KD | 仍较高 | x.xx | x.xx |
+| Pretrained (no KD) | x.xx | 0.055 | x.xx |
+| Standard KD | 0.330 | 0.055 | 0.169 |
 
 ---
 
 ## Phase 2: Exp 2 — 主实验表 SQuAD（§4.3）
 
-**这是论文最核心的表格。** SQuAD 上的 EM, F1, Mean JSD。
+**这是论文最核心的表格。**
 
-### 三个方法 × 三个种子 = 9 runs
+### 训练（4 卡并行）
 
 ```bash
-# === Standard KD（已在 Phase 1 训完，补充评测即可）===
-for SEED in 42 123 456; do
-    python scripts/evaluate.py \
-        --student_ckpt outputs/standard_kd/seed_${SEED}/student_final.pt \
-        --dataset squad --subset test \
-        --output_path outputs/standard_kd/seed_${SEED}/eval_metrics.json \
-        --device cuda:0
-done
-
-# === Reverse KL ===
-for SEED in 42 123 456; do
+# === Reverse KL（3 种子并行）===
+for i in 0 1 2; do
+    SEED=(42 123 456)
     python scripts/train.py \
         --method reverse_kl --dataset squad \
-        --seed $SEED --output_dir outputs/ \
-        --device cuda:0
+        --seed ${SEED[$i]} --output_dir outputs/ \
+        --device cuda:$i &
 done
+wait
 
-# === SaGD (our method) ===
-for SEED in 42 123 456; do
+# === SaGD（3 种子并行）===
+for i in 0 1 2; do
+    SEED=(42 123 456)
     python scripts/train.py \
         --method sagd --dataset squad \
         --teacher_saliency_path data/teacher_saliency_squad.pt \
         --lambda_noise 0.5 --noise_sigma 0.1 --sagd_every_n_steps 5 --sagd_tau_w 1.0 \
-        --seed $SEED --output_dir outputs/ \
-        --device cuda:0
+        --seed ${SEED[$i]} --output_dir outputs/ \
+        --device cuda:$i &
 done
+wait
 ```
 
-### 评测每个 checkpoint
+### 评测（所有 checkpoint）
 
 ```bash
 for METHOD in standard_kd reverse_kl sagd; do
@@ -177,7 +159,7 @@ for METHOD in standard_kd reverse_kl sagd; do
             --output_path outputs/${METHOD}/seed_${SEED}/eval_metrics.json \
             --device cuda:0
 
-        # Saliency Loyalty (Mean JSD, on val subset)
+        # Saliency Loyalty + EC (on val subset, teacher on-the-fly)
         python scripts/diagnose_saliency.py \
             --teacher_model Qwen/Qwen3-8B \
             --student_ckpt outputs/${METHOD}/seed_${SEED}/student_final.pt \
@@ -188,6 +170,24 @@ for METHOD in standard_kd reverse_kl sagd; do
 done
 ```
 
+### 汇总结果
+
+```bash
+python -c "
+import json, numpy as np
+for method in ['standard_kd', 'reverse_kl', 'sagd']:
+    ems, f1s, jsds = [], [], []
+    for seed in [42, 123, 456]:
+        with open(f'outputs/{method}/seed_{seed}/eval_metrics.json') as f:
+            m = json.load(f)
+        ems.append(m['exact_match']); f1s.append(m['token_f1'])
+        with open(f'outputs/{method}/seed_{seed}/saliency_diagnosis.json') as f:
+            d = json.load(f)
+        jsds.append(d['mean_jsd'])
+    print(f'{method:15s} | EM: {np.mean(ems):.3f}±{np.std(ems):.3f} | F1: {np.mean(f1s):.3f}±{np.std(f1s):.3f} | JSD: {np.mean(jsds):.3f}±{np.std(jsds):.3f}')
+"
+```
+
 ### 要报告的表格
 
 | Method | EM ↑ | Token F1 ↑ | Mean JSD ↓ |
@@ -196,40 +196,36 @@ done
 | Reverse KL | x.xx ± x.xx | x.xx ± x.xx | x.xx ± x.xx |
 | **SaGD (ours)** | **x.xx ± x.xx** | **x.xx ± x.xx** | **x.xx ± x.xx** |
 
-三个种子取 mean 和 std。
-
 ---
 
 ## Phase 3: Exp 3 — Evidence Concentration 深度分析（§4.4）
 
-**论文问题**: SaGD 是否保留了 teacher 的推理模式？
-
-从 Phase 2 的 saliency_diagnosis.json 中提取 teacher/student EC 对比：
+**无需额外训练**——从 Phase 2 的 `saliency_diagnosis.json` 提取。
 
 ```bash
 python -c "
 import json
-for method in ['standard_kd', 'sagd']:
-    with open(f'outputs/{method}/seed_42/saliency_diagnosis.json') as f:
-        d = json.load(f)
-    print(f'\n=== {method} ===')
-    print(f'Mean JSD: {d[\"mean_jsd\"]:.4f}')
-    print(f'Teacher EC: {d[\"teacher_evidence_concentration\"]:.4f}')
-    print(f'Student EC: {d[\"student_evidence_concentration\"]:.4f}')
+for method in ['standard_kd', 'reverse_kl', 'sagd']:
+    tecs, secs = [], []
+    for seed in [42, 123, 456]:
+        with open(f'outputs/{method}/seed_{seed}/saliency_diagnosis.json') as f:
+            d = json.load(f)
+        tecs.append(d['teacher_evidence_concentration'])
+        secs.append(d['student_evidence_concentration'])
+    import numpy as np
+    print(f'{method:15s} | Teacher EC: {np.mean(tecs):.4f} | Student EC: {np.mean(secs):.4f}±{np.std(secs):.4f}')
 "
 ```
 
 ### 要报告的数据
 
-1. **EC 柱状图**: Teacher vs Standard KD student vs SaGD student
-2. **叙事**: Teacher 分散注意力在全局 context（低 EC）= 全局推理；Standard KD student 过度集中在 answer span（高 EC）= shortcut learning；SaGD student 的 EC 接近 teacher = 保留推理模式
-3. **Case study**: 挑 3 个样本，可视化 teacher/student saliency heatmap
+1. **EC 柱状图**: Teacher vs Standard KD vs SaGD 的 evidence concentration
+2. **叙事**: Teacher 低 EC = 全局推理；Standard KD 高 EC = shortcut；SaGD 接近 teacher
+3. **Case study**: 挑 3 个样本，可视化 saliency heatmap + answer span
 
 ---
 
 ## Phase 4: Exp 4 — 消融实验（§4.5）
-
-**论文问题**: Noise KL 和 reweighting 各自贡献多少？
 
 ### 消融配置表
 
@@ -238,72 +234,153 @@ for method in ['standard_kd', 'sagd']:
 | `sagd` (full) | 0.5 | 0.1 | 1.0 | 完整方法 |
 | `sagd_noise_only` | 0.5 | 0.1 | 100.0 | τ_w≈∞ → 均匀权重 → 只有 noise KL |
 | `sagd_reweight_only` | 0.0 | — | 1.0 | 无 noise KL → 只有 reweighting |
-| `standard_kd` | — | — | — | baseline（已有） |
 
-### 运行消融
+### 运行消融（并行）
 
 ```bash
-# --- Ablation: noise KL only (λ=0.5, τ_w=100 → uniform weights) ---
-for SEED in 42 123 456; do
+# --- noise KL only ---
+for i in 0 1 2; do
+    SEED=(42 123 456)
     python scripts/train.py \
         --method sagd --dataset squad \
         --teacher_saliency_path data/teacher_saliency_squad.pt \
         --lambda_noise 0.5 --noise_sigma 0.1 --sagd_tau_w 100.0 --sagd_every_n_steps 5 \
-        --seed $SEED --output_dir outputs_ablation/sagd_noise_only/ \
-        --device cuda:0
+        --seed ${SEED[$i]} --output_dir outputs_ablation/sagd_noise_only/ \
+        --device cuda:$i &
 done
+wait
 
-# --- Ablation: reweight only (λ=0, no noise KL) ---
-for SEED in 42 123 456; do
+# --- reweight only ---
+for i in 0 1 2; do
+    SEED=(42 123 456)
     python scripts/train.py \
         --method sagd --dataset squad \
         --teacher_saliency_path data/teacher_saliency_squad.pt \
         --lambda_noise 0.0 --noise_sigma 0.1 --sagd_tau_w 1.0 --sagd_every_n_steps 5 \
-        --seed $SEED --output_dir outputs_ablation/sagd_reweight_only/ \
-        --device cuda:0
+        --seed ${SEED[$i]} --output_dir outputs_ablation/sagd_reweight_only/ \
+        --device cuda:$i &
+done
+wait
+```
+
+### 评测消融
+
+```bash
+for CONFIG in sagd_noise_only sagd_reweight_only; do
+    for SEED in 42 123 456; do
+        python scripts/evaluate.py \
+            --student_ckpt outputs_ablation/${CONFIG}/sagd/seed_${SEED}/student_final.pt \
+            --dataset squad --subset test \
+            --output_path outputs_ablation/${CONFIG}/sagd/seed_${SEED}/eval_metrics.json \
+            --device cuda:0
+
+        python scripts/diagnose_saliency.py \
+            --teacher_model Qwen/Qwen3-8B \
+            --student_ckpt outputs_ablation/${CONFIG}/sagd/seed_${SEED}/student_final.pt \
+            --dataset squad --subset val \
+            --output_path outputs_ablation/${CONFIG}/sagd/seed_${SEED}/saliency_diagnosis.json \
+            --device cuda:0
+    done
 done
 ```
 
-### 超参敏感性（Appendix）
+### 超参敏感性 sweep（单种子 seed=42，4 卡并行）
 
 ```bash
-# --- λ sweep (noise KL weight) ---
+# --- λ sweep ---
+LAMBDAS=(0.1 0.5 1.0 2.0 5.0)
+for i in "${!LAMBDAS[@]}"; do
+    GPU=$((i % 4))
+    python scripts/train.py \
+        --method sagd --dataset squad \
+        --teacher_saliency_path data/teacher_saliency_squad.pt \
+        --lambda_noise ${LAMBDAS[$i]} --noise_sigma 0.1 --sagd_tau_w 1.0 \
+        --seed 42 --output_dir outputs_sweep/lambda_${LAMBDAS[$i]}/ \
+        --device cuda:$GPU &
+    # 每 4 个等一批
+    if (( (i+1) % 4 == 0 )); then wait; fi
+done
+wait
+
+# --- σ sweep ---
+SIGMAS=(0.001 0.005 0.01 0.02 0.05 0.1 0.2 0.5)
+for i in "${!SIGMAS[@]}"; do
+    GPU=$((i % 4))
+    python scripts/train.py \
+        --method sagd --dataset squad \
+        --teacher_saliency_path data/teacher_saliency_squad.pt \
+        --lambda_noise 0.5 --noise_sigma ${SIGMAS[$i]} --sagd_tau_w 1.0 \
+        --seed 42 --output_dir outputs_sweep/sigma_${SIGMAS[$i]}/ \
+        --device cuda:$GPU &
+    if (( (i+1) % 4 == 0 )); then wait; fi
+done
+wait
+
+# --- τ_w sweep ---
+TAUS=(0.1 0.5 1.0 2.0 5.0)
+for i in "${!TAUS[@]}"; do
+    GPU=$((i % 4))
+    python scripts/train.py \
+        --method sagd --dataset squad \
+        --teacher_saliency_path data/teacher_saliency_squad.pt \
+        --lambda_noise 0.5 --noise_sigma 0.1 --sagd_tau_w ${TAUS[$i]} \
+        --seed 42 --output_dir outputs_sweep/tau_${TAUS[$i]}/ \
+        --device cuda:$GPU &
+    if (( (i+1) % 4 == 0 )); then wait; fi
+done
+wait
+
+# --- N sweep ---
+NS=(1 3 5 10 20)
+for i in "${!NS[@]}"; do
+    GPU=$((i % 4))
+    python scripts/train.py \
+        --method sagd --dataset squad \
+        --teacher_saliency_path data/teacher_saliency_squad.pt \
+        --lambda_noise 0.5 --noise_sigma 0.1 --sagd_tau_w 1.0 --sagd_every_n_steps ${NS[$i]} \
+        --seed 42 --output_dir outputs_sweep/every_n_${NS[$i]}/ \
+        --device cuda:$GPU &
+    if (( (i+1) % 4 == 0 )); then wait; fi
+done
+wait
+```
+
+### 评测 sweep
+
+```bash
+# λ sweep
 for LAMBDA in 0.1 0.5 1.0 2.0 5.0; do
-    python scripts/train.py \
-        --method sagd --dataset squad \
-        --teacher_saliency_path data/teacher_saliency_squad.pt \
-        --lambda_noise $LAMBDA --noise_sigma 0.1 --sagd_tau_w 1.0 \
-        --seed 42 --output_dir outputs_sweep/lambda_${LAMBDA}/ \
+    python scripts/evaluate.py \
+        --student_ckpt outputs_sweep/lambda_${LAMBDA}/sagd/seed_42/student_final.pt \
+        --dataset squad --subset test \
+        --output_path outputs_sweep/lambda_${LAMBDA}/sagd/seed_42/eval_metrics.json \
         --device cuda:0
 done
 
-# --- σ sweep (noise magnitude) ---
+# σ sweep
 for SIGMA in 0.001 0.005 0.01 0.02 0.05 0.1 0.2 0.5; do
-    python scripts/train.py \
-        --method sagd --dataset squad \
-        --teacher_saliency_path data/teacher_saliency_squad.pt \
-        --lambda_noise 0.5 --noise_sigma $SIGMA --sagd_tau_w 1.0 \
-        --seed 42 --output_dir outputs_sweep/sigma_${SIGMA}/ \
+    python scripts/evaluate.py \
+        --student_ckpt outputs_sweep/sigma_${SIGMA}/sagd/seed_42/student_final.pt \
+        --dataset squad --subset test \
+        --output_path outputs_sweep/sigma_${SIGMA}/sagd/seed_42/eval_metrics.json \
         --device cuda:0
 done
 
-# --- τ_w sweep (DRO strength) ---
+# τ_w sweep
 for TAU in 0.1 0.5 1.0 2.0 5.0; do
-    python scripts/train.py \
-        --method sagd --dataset squad \
-        --teacher_saliency_path data/teacher_saliency_squad.pt \
-        --lambda_noise 0.5 --noise_sigma 0.1 --sagd_tau_w $TAU \
-        --seed 42 --output_dir outputs_sweep/tau_${TAU}/ \
+    python scripts/evaluate.py \
+        --student_ckpt outputs_sweep/tau_${TAU}/sagd/seed_42/student_final.pt \
+        --dataset squad --subset test \
+        --output_path outputs_sweep/tau_${TAU}/sagd/seed_42/eval_metrics.json \
         --device cuda:0
 done
 
-# --- N (SaGD step frequency) sweep ---
+# N sweep
 for N in 1 3 5 10 20; do
-    python scripts/train.py \
-        --method sagd --dataset squad \
-        --teacher_saliency_path data/teacher_saliency_squad.pt \
-        --lambda_noise 0.5 --noise_sigma 0.1 --sagd_tau_w 1.0 --sagd_every_n_steps $N \
-        --seed 42 --output_dir outputs_sweep/every_n_${N}/ \
+    python scripts/evaluate.py \
+        --student_ckpt outputs_sweep/every_n_${N}/sagd/seed_42/student_final.pt \
+        --dataset squad --subset test \
+        --output_path outputs_sweep/every_n_${N}/sagd/seed_42/eval_metrics.json \
         --device cuda:0
 done
 ```
@@ -319,18 +396,18 @@ done
 | + Reweight only | weighted | — | ✓ | x.xx | x.xx | x.xx |
 | **SaGD (full)** | weighted | ✓ | ✓ | **x.xx** | **x.xx** | **x.xx** |
 
-**超参敏感性图 (Appendix)**: λ vs EM, σ vs EM, τ_w vs EM 折线图
+**超参敏感性图 (Appendix)**: λ vs EM, σ vs EM, τ_w vs EM, N vs EM 折线图
 
 ---
 
 ## Phase 5: Exp 5 — 训练动态（§4.6）
 
-**数据来源**: SaGD 训练的 `training_stats.jsonl`。
+**无需额外训练**——从 Phase 2 的 SaGD 训练 log 提取。
 
 ```bash
-# 从 Phase 2 的 SaGD run 中提取
 cat outputs/sagd/seed_42/training_stats.jsonl | python -c "
 import sys, json
+print('step\tloss\tkl_noisy\tkl_clean\tmean_jsd\tmax_weight')
 for line in sys.stdin:
     d = json.loads(line)
     if 'sagd/kl_noisy' in d:
@@ -338,53 +415,54 @@ for line in sys.stdin:
 " > outputs/sagd/seed_42/dynamics.tsv
 ```
 
-### 需要额外的 epoch-level 诊断
+### Epoch-level 诊断（需要 teacher 模型）
 
 ```bash
-for EPOCH in 1 2 3; do
-    python scripts/diagnose_saliency.py \
-        --teacher_model Qwen/Qwen3-8B \
-        --student_ckpt outputs/sagd/seed_42/student_epoch${EPOCH}.pt \
-        --dataset squad --subset val \
-        --output_path outputs/sagd/seed_42/saliency_epoch${EPOCH}.json \
-        --device cuda:0
-
-    python scripts/diagnose_saliency.py \
-        --teacher_model Qwen/Qwen3-8B \
-        --student_ckpt outputs/standard_kd/seed_42/student_epoch${EPOCH}.pt \
-        --dataset squad --subset val \
-        --output_path outputs/standard_kd/seed_42/saliency_epoch${EPOCH}.json \
-        --device cuda:0
+for METHOD in sagd standard_kd; do
+    for EPOCH in 1 2 3; do
+        python scripts/diagnose_saliency.py \
+            --teacher_model Qwen/Qwen3-8B \
+            --student_ckpt outputs/${METHOD}/seed_42/student_epoch${EPOCH}.pt \
+            --dataset squad --subset val \
+            --output_path outputs/${METHOD}/seed_42/saliency_epoch${EPOCH}.json \
+            --device cuda:0
+    done
 done
 ```
 
 ### 要报告的图
 
-1. **Noise KL vs step**: `sagd/kl_noisy` 和 `sagd/kl_clean` 的差异（差异 = Jacobian gap 的代理）
-2. **Mean JSD vs epoch**: SaGD vs Standard KD 的 JSD 随 epoch 变化
-3. **Max weight vs step**: 展示 DRO reweighting 的动态
+1. **kl_noisy - kl_clean vs step**（差异 = Jacobian gap 的代理，应该随训练下降）
+2. **Mean JSD vs epoch**: SaGD vs Standard KD
+3. **Max weight vs step**: DRO reweighting 的动态
 
 ---
 
 ## Phase 6: Exp 6 — Dolly 泛化验证（§4.7）
 
-**论文问题**: SaGD 是否泛化到非 extractive QA 任务？
-
 ```bash
-for METHOD in standard_kd sagd; do
-    for SEED in 42 123 456; do
-        EXTRA_ARGS=""
-        if [ "$METHOD" == "sagd" ]; then
-            EXTRA_ARGS="--teacher_saliency_path data/teacher_saliency_dolly.pt \
-                        --lambda_noise 0.5 --noise_sigma 0.1 --sagd_every_n_steps 5 --sagd_tau_w 1.0"
-        fi
-
-        python scripts/train.py \
-            --method $METHOD --dataset dolly \
-            --seed $SEED --output_dir outputs_dolly/ \
-            $EXTRA_ARGS --device cuda:0
-    done
+# 训练（并行）
+for i in 0 1 2; do
+    SEED=(42 123 456)
+    # Standard KD
+    python scripts/train.py \
+        --method standard_kd --dataset dolly \
+        --seed ${SEED[$i]} --output_dir outputs_dolly/ \
+        --device cuda:$i &
 done
+wait
+
+for i in 0 1 2; do
+    SEED=(42 123 456)
+    # SaGD
+    python scripts/train.py \
+        --method sagd --dataset dolly \
+        --teacher_saliency_path data/teacher_saliency_dolly.pt \
+        --lambda_noise 0.5 --noise_sigma 0.1 --sagd_every_n_steps 5 --sagd_tau_w 1.0 \
+        --seed ${SEED[$i]} --output_dir outputs_dolly/ \
+        --device cuda:$i &
+done
+wait
 
 # 评测
 for METHOD in standard_kd sagd; do
@@ -414,7 +492,7 @@ done
 **模型对**: LLaMA 3.1-8B → LLaMA 3.1-1B
 
 ```bash
-# 预计算 LLaMA teacher saliency (SQuAD)
+# 预计算 LLaMA teacher saliency
 python scripts/precompute_teacher_saliency.py \
     --model_name meta-llama/Llama-3.1-8B \
     --tokenizer_name meta-llama/Llama-3.1-1B \
@@ -422,23 +500,28 @@ python scripts/precompute_teacher_saliency.py \
     --output_path data/teacher_saliency_llama_squad.pt \
     --batch_size 4 --max_seq_len 512 --device cuda:0
 
-# 训练
-for METHOD in standard_kd sagd; do
-    for SEED in 42 123 456; do
-        EXTRA_ARGS=""
-        if [ "$METHOD" == "sagd" ]; then
-            EXTRA_ARGS="--teacher_saliency_path data/teacher_saliency_llama_squad.pt \
-                        --lambda_noise 0.5 --noise_sigma 0.1 --sagd_every_n_steps 5 --sagd_tau_w 1.0"
-        fi
-
-        python scripts/train.py \
-            --method $METHOD --dataset squad \
-            --teacher_model meta-llama/Llama-3.1-8B \
-            --student_model meta-llama/Llama-3.1-1B \
-            --seed $SEED --output_dir outputs_llama/ \
-            $EXTRA_ARGS --device cuda:0
-    done
+# 训练（并行）
+for i in 0 1 2; do
+    SEED=(42 123 456)
+    python scripts/train.py \
+        --method standard_kd --dataset squad \
+        --teacher_model meta-llama/Llama-3.1-8B --student_model meta-llama/Llama-3.1-1B \
+        --seed ${SEED[$i]} --output_dir outputs_llama/ \
+        --device cuda:$i &
 done
+wait
+
+for i in 0 1 2; do
+    SEED=(42 123 456)
+    python scripts/train.py \
+        --method sagd --dataset squad \
+        --teacher_model meta-llama/Llama-3.1-8B --student_model meta-llama/Llama-3.1-1B \
+        --teacher_saliency_path data/teacher_saliency_llama_squad.pt \
+        --lambda_noise 0.5 --noise_sigma 0.1 --sagd_every_n_steps 5 --sagd_tau_w 1.0 \
+        --seed ${SEED[$i]} --output_dir outputs_llama/ \
+        --device cuda:$i &
+done
+wait
 
 # 评测
 for METHOD in standard_kd sagd; do
@@ -453,26 +536,14 @@ for METHOD in standard_kd sagd; do
 done
 ```
 
-### 要报告的表格
-
-| Architecture | Method | EM ↑ | F1 ↑ | JSD ↓ |
-|-------------|--------|------|------|-------|
-| Qwen 8B→0.6B | Standard KD | x.xx | x.xx | x.xx |
-| Qwen 8B→0.6B | **SaGD** | **x.xx** | **x.xx** | **x.xx** |
-| LLaMA 8B→1B | Standard KD | x.xx | x.xx | x.xx |
-| LLaMA 8B→1B | **SaGD** | **x.xx** | **x.xx** | **x.xx** |
-
 ---
 
 ## Phase 8: Exp 8 — Benchmark 防御（Appendix）
-
-**目的**: 证明 SaGD 提升 EM/F1 的同时没有损害通用能力。
 
 ```bash
 pip install lm-eval
 
 for METHOD in standard_kd sagd; do
-    # 先转为 HuggingFace 格式
     python -c "
 from sagd.models import load_student; import torch
 student, _ = load_student('Qwen/Qwen3-0.6B', 'cpu')
@@ -482,53 +553,46 @@ student.save_pretrained('outputs/${METHOD}/seed_42/hf_model/')
     lm_eval --model hf \
         --model_args pretrained=outputs/${METHOD}/seed_42/hf_model/ \
         --tasks mmlu,arc_challenge,truthfulqa_mc2 \
-        --batch_size 8 \
-        --output_path outputs/${METHOD}/seed_42/benchmark/
+        --batch_size 8 --output_path outputs/${METHOD}/seed_42/benchmark/
 done
 
-# Base student
 lm_eval --model hf \
     --model_args pretrained=Qwen/Qwen3-0.6B \
     --tasks mmlu,arc_challenge,truthfulqa_mc2 \
-    --batch_size 8 \
-    --output_path outputs/base_student_benchmark/
+    --batch_size 8 --output_path outputs/base_student_benchmark/
 ```
 
 ---
 
-## 输出目录结构总览
+## 输出目录结构
 
 ```
 data/
-├── teacher_saliency_squad.pt      ← SQuAD teacher (primary)
-├── teacher_saliency_dolly.pt      ← Dolly teacher (secondary)
-└── teacher_saliency_llama_squad.pt ← LLaMA teacher
+├── teacher_saliency_squad.pt
+├── teacher_saliency_dolly.pt
+└── teacher_saliency_llama_squad.pt
 
-outputs/                           ← SQuAD 主实验
+outputs/                           ← SQuAD 主实验 (Phase 1-3, 5)
 ├── standard_kd/seed_{42,123,456}/
-│   ├── config.json, student_final.pt, training_stats.jsonl
+│   ├── config.json, student_final.pt, student_epoch{1,2,3}.pt
+│   ├── training_stats.jsonl
 │   ├── eval_metrics.json          ← EM, F1, ROUGE-L, PPL
-│   └── saliency_diagnosis.json    ← JSD + Evidence Concentration
-├── reverse_kl/...
-├── sagd/...
+│   └── saliency_diagnosis.json    ← JSD, EC
+├── reverse_kl/seed_{42,123,456}/
+├── sagd/seed_{42,123,456}/
 
-outputs_ablation/                  ← SQuAD 消融
+outputs_ablation/                  ← 消融 (Phase 4)
 ├── sagd_noise_only/sagd/seed_{42,123,456}/
 ├── sagd_reweight_only/sagd/seed_{42,123,456}/
 
-outputs_sweep/                     ← SQuAD 超参 sweep
+outputs_sweep/                     ← 超参 sweep (Phase 4, seed=42 only)
 ├── lambda_{0.1,...,5.0}/sagd/seed_42/
 ├── sigma_{0.001,...,0.5}/sagd/seed_42/
 ├── tau_{0.1,...,5.0}/sagd/seed_42/
 ├── every_n_{1,...,20}/sagd/seed_42/
 
-outputs_dolly/                     ← Dolly 泛化
-├── standard_kd/seed_{42,123,456}/
-├── sagd/seed_{42,123,456}/
-
-outputs_llama/                     ← LLaMA 跨架构
-├── standard_kd/seed_{42,123,456}/
-├── sagd/seed_{42,123,456}/
+outputs_dolly/                     ← Dolly 泛化 (Phase 6)
+outputs_llama/                     ← LLaMA 跨架构 (Phase 7)
 ```
 
 ---
@@ -539,74 +603,45 @@ outputs_llama/                     ← LLaMA 跨架构
 # 1. 单元测试
 pytest tests/ -v
 
-# 2. SQuAD smoke test
-python scripts/precompute_teacher_saliency.py \
-    --dataset squad --max_samples 200 \
-    --output_path data/test_saliency_squad.pt --device cuda:0
-
-python scripts/train.py \
-    --method standard_kd --dataset squad \
-    --epochs 1 --max_train_samples 200 \
-    --device cuda:0 --skip_eval
-
+# 2. 快速验证 SaGD 训练不报错
 python scripts/train.py \
     --method sagd --dataset squad \
-    --teacher_saliency_path data/test_saliency_squad.pt \
+    --teacher_saliency_path data/teacher_saliency_squad.pt \
     --lambda_noise 0.5 --noise_sigma 0.1 \
     --epochs 1 --max_train_samples 200 \
-    --device cuda:0 --skip_eval
+    --device cuda:0
 ```
 
 ---
 
 ## 实验与论文章节的对应
 
-| 论文章节 | 实验 | 回答的问题 | 核心指标 |
-|---------|------|-----------|---------|
-| §4.2 | Exp 1 | Standard KD 保留 saliency 吗？ | Mean JSD, EC |
-| §4.3 | Exp 2 | SaGD vs baselines 谁更好？ | EM, F1, JSD |
-| §4.4 | Exp 3 | Student 保留了 teacher 的推理模式吗？ | Evidence Concentration |
-| §4.5 | Exp 4 | 两个组件各自贡献多少？ | EM, F1, JSD |
-| §4.6 | Exp 5 | 训练中 saliency 如何变化？ | kl_noisy, JSD vs step |
-| §4.7 | Exp 6 | SQuAD 之外能泛化吗？ | ROUGE-L on Dolly |
-| §4.8 | Exp 7 | 跨架构能泛化吗？ | EM, F1 on LLaMA pair |
-| Appendix | Exp 8 | 通用能力有损害吗？ | MMLU, ARC-C, TruthfulQA |
+| 论文章节 | Phase | 回答的问题 | 核心指标 |
+|---------|-------|-----------|---------|
+| §4.2 | 1 | Standard KD 保留 saliency 吗？ | Mean JSD, EC |
+| §4.3 | 2 | SaGD vs baselines 谁更好？ | EM, F1, JSD |
+| §4.4 | 3 | Student 保留了 teacher 的推理模式吗？ | Evidence Concentration |
+| §4.5 | 4 | 两个组件各自贡献多少？ | EM, F1, JSD |
+| §4.6 | 5 | 训练中 Jacobian gap 如何变化？ | kl_noisy-kl_clean, JSD vs step |
+| §4.7 | 6 | SQuAD 之外能泛化吗？ | ROUGE-L on Dolly |
+| §4.8 | 7 | 跨架构能泛化吗？ | EM, F1 on LLaMA pair |
+| Appendix | 8 | 通用能力有损害吗？ | MMLU, ARC-C, TruthfulQA |
 
 ---
 
-## 扩展评测系统
+## 总计算量估算
 
-### 评测指标一览
+| Phase | Runs | GPU-hours (A100) |
+|-------|------|-----------------|
+| 0 | 2 | 3 |
+| 1 | 3 train + 4 diagnose | 12 |
+| 2 | 6 train + 18 eval/diagnose | 24 |
+| 3 | 0（从 Phase 2 提取） | 0 |
+| 4 | 6 ablation + 23 sweep + 29 eval | 100 |
+| 5 | 6 diagnose | 3 |
+| 6 | 6 train + 6 eval | 24 |
+| 7 | 6 train + 6 eval + 1 precompute | 30 |
+| 8 | 3 lm-eval | 6 |
+| **Total** | | **~200 GPU-hours** |
 
-| 指标 | 用途 | 数据集 | 备注 |
-|------|------|--------|------|
-| Exact Match | 答案完全正确 | SQuAD | 主指标 |
-| Token F1 | 答案词级重叠 | SQuAD | 主指标 |
-| Mean JSD | Saliency 忠诚度 | 两者 | 核心二级指标 |
-| Evidence Concentration | Saliency 在答案 span 上的比例 | SQuAD | 分析指标 |
-| ROUGE-L | 文本重叠度 | Dolly | 泛化指标 |
-| BERTScore | 语义相似度 | 两者 | 可选 |
-| Perplexity | 语言模型质量 | 两者 | 越低越好 |
-| GPT-as-Judge | 人类偏好代理 | 两者 | 需 OpenAI API |
-
-### GPT-as-Judge 对比
-
-```bash
-# 预生成 responses
-for METHOD in standard_kd sagd; do
-    for SEED in 42 123 456; do
-        python scripts/generate_responses.py \
-            --student_ckpt outputs/${METHOD}/seed_${SEED}/student_final.pt \
-            --dataset squad --subset test \
-            --output_path outputs/${METHOD}/seed_${SEED}/responses.jsonl \
-            --device cuda:0
-    done
-done
-
-# Pairwise judge
-python scripts/gpt_judge.py \
-    --responses_a outputs/standard_kd/seed_42/responses.jsonl \
-    --responses_b outputs/sagd/seed_42/responses.jsonl \
-    --label_a "Standard KD" --label_b "SaGD" \
-    --output_path outputs/gpt_judge_std_vs_sagd_seed42.json
-```
+4× A100 并行约需 **~50 wall-clock hours（~2 天）**。

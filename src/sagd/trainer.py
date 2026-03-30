@@ -150,8 +150,9 @@ class Trainer:
     ) -> torch.Tensor:
         """Compute per-position noise scale from saliency difference.
 
-        σ_j = σ_base * max(|s_T,j - s_S,j|, δ) / mean(max(|s_T - s_S|, δ))
-        Mean-normalized so average noise magnitude equals σ_base.
+        σ_j = σ_base * clamp(max(|s_T,j - s_S,j|, δ) / mean(...), max=5)
+        Mean-normalized so average noise magnitude ≈ σ_base.
+        Clamped to [δ, 5×σ_base] to prevent extreme values that cause NaN.
 
         Returns:
             sigma_per_pos: (B, L)
@@ -159,7 +160,8 @@ class Trainer:
         sal_diff = (teacher_sal - student_sal).abs()  # (B, L)
         sal_diff = sal_diff.clamp(min=1e-6)
         sal_diff_mean = sal_diff.mean(dim=-1, keepdim=True).clamp(min=1e-8)  # (B, 1)
-        return self.noise_sigma * sal_diff / sal_diff_mean  # (B, L)
+        ratio = (sal_diff / sal_diff_mean).clamp(max=5.0)  # cap at 5× mean
+        return self.noise_sigma * ratio  # (B, L)
 
     def _compute_noisy_kl(
         self,

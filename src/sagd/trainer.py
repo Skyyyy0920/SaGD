@@ -218,14 +218,15 @@ class Trainer:
             t_logits_noisy, s_logits_noisy, labels_mask,
         )  # (B,)
 
-        # NaN guard: replace NaN with 0 (skip noise KL for corrupted samples)
-        nan_mask = torch.isnan(per_sample_kl_noisy)
-        if nan_mask.any():
-            per_sample_kl_noisy = per_sample_kl_noisy.masked_fill(nan_mask, 0.0)
+        # NaN/Inf guard: if ANY sample is NaN/Inf, detach the entire noisy KL
+        # to prevent corrupted gradients from flowing into model parameters.
+        # masked_fill alone is NOT safe: 0 * NaN_gradient = NaN in autograd.
+        if torch.isnan(per_sample_kl_noisy).any() or torch.isinf(per_sample_kl_noisy).any():
+            per_sample_kl_noisy = torch.zeros_like(per_sample_kl_noisy)  # fully detached, no graph
 
         stats = {
             "embed_norm": s_embed_norm,
-            "noise_ratio": self.noise_sigma,  # now relative, so this IS the ratio
+            "noise_ratio": self.noise_sigma,  # relative to embed norm
         }
 
         return per_sample_kl_noisy, stats

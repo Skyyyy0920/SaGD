@@ -4,7 +4,7 @@ Implements all baseline methods from DA-KD (ICML 2025) comparison:
   - StandardKDLoss: Forward KL (Hinton, 2015)
   - ReverseKLLoss: Reverse KL / MiniLLM (Gu et al., 2024)
   - SFTLoss: Supervised fine-tuning (cross-entropy on ground truth)
-  - SeqKDLoss: Sequence-level KD (Kim & Rush, 2016) — SFT on teacher outputs
+    Also used by SeqKD (Kim & Rush, 2016) with teacher argmax as targets.
   - JSDLoss: Generalized JSD for GKD (Agarwal et al., 2023)
   - SkewKLLoss: Skew KL for DistiLLM (Ko et al., 2024)
   - BDLLoss: Bidirectional Discrepancy Loss for DA-KD (He et al., 2025)

@@ -11,11 +11,11 @@ Combined with saliency-guided sample reweighting (DRO).
 from __future__ import annotations
 
 import json
+import math
 import os
+import random
 from pathlib import Path
 from typing import Any
-
-import math
 
 import torch
 import torch.nn as nn
@@ -138,7 +138,6 @@ class Trainer:
 
     def _compute_dakd_subset(
         self,
-        dataloader: DataLoader,
         epoch: int,
     ) -> Subset | None:
         """DA-KD DiffUp: compute DDS scores and select a subset for this epoch.
@@ -156,23 +155,29 @@ class Trainer:
         r = 0.5 * (math.cos(math.pi * epoch / E) + 1)  # cosine decay
         r = max(r, 0.1)  # minimum 10% of data
 
+        # Use a non-shuffled dataloader for deterministic index tracking
+        score_loader = DataLoader(
+            self.dataset, batch_size=self.batch_size,
+            shuffle=False, collate_fn=collate_fn, drop_last=False,
+        )
+
         # Compute per-sample cross-entropy for teacher and student
         self.student.eval()
-        teacher_losses = []
-        student_losses = []
+        all_dds: list[tuple[int, float]] = []  # (dataset_index, dds_score)
 
         with torch.no_grad():
-            for batch in tqdm(dataloader, desc=f"DDS scoring (epoch {epoch+1})", leave=False):
+            for batch in tqdm(score_loader, desc=f"DDS scoring (epoch {epoch+1})", leave=False):
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels_mask = batch["labels_mask"].to(self.device)
+                indices = batch["index"]  # (B,) — dataset indices
 
                 t_out = self.teacher(input_ids=input_ids, attention_mask=attention_mask)
                 s_out = self.student(input_ids=input_ids, attention_mask=attention_mask)
 
                 # Per-sample cross-entropy on response tokens
-                for logits, losses_list in [(t_out.logits.float(), teacher_losses),
-                                            (s_out.logits.float(), student_losses)]:
+                for logits, tag in [(t_out.logits.float(), "t"),
+                                    (s_out.logits.float(), "s")]:
                     shift_logits = logits[:, :-1, :]
                     shift_labels = input_ids[:, 1:]
                     mask = labels_mask[:, 1:].float()
@@ -183,36 +188,38 @@ class Trainer:
                     ).squeeze(-1)  # (B, L-1)
 
                     per_sample = (token_nll * mask).sum(dim=-1) / mask.sum(dim=-1).clamp(min=1)
-                    losses_list.extend(per_sample.cpu().tolist())
+                    if tag == "t":
+                        t_losses = per_sample.cpu()
+                    else:
+                        s_losses = per_sample.cpu()
+
+                # DDS = student_loss / teacher_loss
+                dds = s_losses / t_losses.clamp(min=1e-6)
+                for idx_val, dds_val in zip(indices.tolist(), dds.tolist()):
+                    all_dds.append((idx_val, dds_val))
 
         self.student.train()
 
-        teacher_losses = torch.tensor(teacher_losses)
-        student_losses = torch.tensor(student_losses)
-
-        # DDS = student_loss / teacher_loss (high = student struggles, teacher confident)
-        dds = student_losses / teacher_losses.clamp(min=1e-6)
-
         # Sort by DDS descending
-        n_total = len(dds)
+        all_dds.sort(key=lambda x: x[1], reverse=True)
+        n_total = len(all_dds)
         n_select = max(int(n_total * r), 1)
-        sorted_indices = dds.argsort(descending=True)
 
         # Stratified sampling: split into high-DDS and low-DDS partitions
-        high_indices = sorted_indices[:n_select].tolist()
-        low_indices = sorted_indices[n_select:].tolist()
+        high_items = all_dds[:n_select]
+        low_items = all_dds[n_select:]
 
         tau = self.dakd_tau
-        n_from_high = max(int((1 - tau) * len(high_indices)), 1)
-        n_from_low = max(int(tau * len(high_indices)), 0)  # same total as n_select
+        n_from_high = max(int((1 - tau) * len(high_items)), 1)
+        n_from_low = max(int(tau * len(high_items)), 0)
 
-        import random
         rng = random.Random(epoch)  # deterministic per epoch
-        selected_high = rng.sample(high_indices, min(n_from_high, len(high_indices)))
-        selected_low = rng.sample(low_indices, min(n_from_low, len(low_indices))) if low_indices else []
+        selected_high = rng.sample(high_items, min(n_from_high, len(high_items)))
+        selected_low = rng.sample(low_items, min(n_from_low, len(low_items))) if low_items else []
 
-        selected = selected_high + selected_low
-        return Subset(self.dataset, selected)
+        # Extract dataset indices
+        selected_indices = [item[0] for item in selected_high + selected_low]
+        return Subset(self.dataset, selected_indices)
 
     def _compute_per_sample_kl(
         self,
@@ -386,7 +393,7 @@ class Trainer:
         for epoch in range(self.epochs):
             # DA-KD DiffUp: select data subset for this epoch
             if self.method == "dakd" and epoch > 0:
-                subset = self._compute_dakd_subset(dataloader, epoch)
+                subset = self._compute_dakd_subset(epoch)
                 if subset is not None:
                     epoch_dataloader = DataLoader(
                         subset, batch_size=self.batch_size,
@@ -491,34 +498,46 @@ class Trainer:
                         # do a forward pass on the student's generated tokens).
                         with torch.no_grad():
                             prompt_lens = (labels_mask == 0).sum(dim=-1)  # (B,)
-                            max_prompt = prompt_lens.max().item()
-                            prompt_ids = input_ids[:, :max_prompt]
-                            prompt_mask = attention_mask[:, :max_prompt]
+                            B_size = input_ids.size(0)
+                            L_orig = input_ids.size(1)
+                            pad_id = self.tokenizer.pad_token_id or 0
+                            max_new = L_orig - prompt_lens.min().item()
+
+                            # Left-pad prompts for batch generation (each sample
+                            # has different prompt length)
+                            max_pl = prompt_lens.max().item()
+                            gen_input = torch.full(
+                                (B_size, max_pl), pad_id,
+                                dtype=torch.long, device=self.device,
+                            )
+                            gen_attn = torch.zeros(
+                                (B_size, max_pl),
+                                dtype=torch.long, device=self.device,
+                            )
+                            for bi in range(B_size):
+                                pl = prompt_lens[bi].item()
+                                gen_input[bi, max_pl - pl:] = input_ids[bi, :pl]
+                                gen_attn[bi, max_pl - pl:] = 1
 
                             gen_out = self.student.generate(
-                                input_ids=prompt_ids,
-                                attention_mask=prompt_mask,
-                                max_new_tokens=input_ids.size(1) - max_prompt,
+                                input_ids=gen_input,
+                                attention_mask=gen_attn,
+                                max_new_tokens=max(max_new, 1),
                                 do_sample=True,
                                 temperature=1.0,
-                                pad_token_id=self.tokenizer.pad_token_id or 0,
-                            )  # (B, L')
+                                pad_token_id=pad_id,
+                            )  # (B, max_pl + generated)
 
-                            # Pad/trim to same length
-                            L_gen = gen_out.size(1)
-                            L_orig = input_ids.size(1)
-                            if L_gen < L_orig:
-                                gen_out = F.pad(gen_out, (0, L_orig - L_gen), value=0)
-                                gen_mask = F.pad(torch.ones(gen_out.size(0), L_gen, device=self.device, dtype=torch.long), (0, L_orig - L_gen), value=0)
-                            else:
-                                gen_out = gen_out[:, :L_orig]
-                                gen_mask = torch.ones_like(gen_out)
+                            # Trim to L_orig total length and build masks
+                            gen_out = gen_out[:, :max_pl + max_new]
+                            L_out = gen_out.size(1)
+                            gen_mask = (gen_out != pad_id).long()
 
-                            # Labels mask: everything after prompt is response
+                            # Labels mask: tokens after each sample's prompt are response
                             gen_labels = torch.zeros_like(gen_out)
-                            for bi in range(gen_out.size(0)):
-                                pl = prompt_lens[bi].item()
-                                gen_labels[bi, pl:] = 1
+                            for bi in range(B_size):
+                                # prompt starts at max_pl - prompt_lens[bi]
+                                gen_labels[bi, max_pl:] = 1
 
                             # Teacher forward on student-generated tokens
                             t_out_gen = self.teacher(input_ids=gen_out, attention_mask=gen_mask)

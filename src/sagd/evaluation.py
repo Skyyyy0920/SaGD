@@ -102,10 +102,11 @@ def generate_responses(
             for j, idx in enumerate(batch_indices):
                 gen_ids = outputs[j, max_prompt_len:]
                 generated = tokenizer.decode(gen_ids, skip_special_tokens=True)
-                # For extractive QA, strip to first line (answers are short spans).
-                # For math reasoning (GSM8K), keep full text so #### pattern is preserved.
+                # Only extractive QA strips to first line (answers are short spans).
+                # All other tasks (instruction-following, summarization, math
+                # reasoning) keep full generated text.
                 category = metas[j]["category"]
-                if category not in ("math_reasoning",):
+                if category == "extractive_qa":
                     generated = generated.split("\n")[0].strip()
                 else:
                     generated = generated.strip()
@@ -370,11 +371,15 @@ def compute_bertscore(
     """
     from bert_score import score as bert_score  # lazy import — optional dep
 
-    refs = [r["reference"] for r in responses]
-    hyps = [r["generated"] for r in responses]
+    # Filter out empty references (e.g., VicunaEval)
+    valid = [(r["reference"], r["generated"]) for r in responses
+             if r["reference"] and r["reference"].strip()]
+    if not valid:
+        return {"bertscore_f": 0.0, "bertscore_p": 0.0, "bertscore_r": 0.0}
+    refs, hyps = zip(*valid)
 
     P, R, F = bert_score(
-        hyps, refs,
+        list(hyps), list(refs),
         model_type=model_type,
         device=device,
         batch_size=batch_size,

@@ -77,7 +77,7 @@ class Trainer:
 
         self.device = config.get("device", "cuda:0")
         self.epochs = config.get("epochs", 3)
-        self.batch_size = config.get("batch_size", 4)
+        self.batch_size = config.get("batch_size", 8)
         self.grad_accum = config.get("gradient_accumulation", 4)
 
         # SaGD does extra forward passes (noise KL on both teacher + student),

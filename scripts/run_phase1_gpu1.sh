@@ -13,7 +13,10 @@ export PYTHONPATH="$(pwd)/src:$PYTHONPATH"
 
 # CUDA_VISIBLE_DEVICES maps physical GPU 1 to logical cuda:0
 DEVICE="cuda:0"
-BATCH_SIZE=4
+# Non-SaGD methods use batch_size=8; SaGD auto-halves to 4 inside trainer
+# (effective batch = batch_size * grad_accum = 32 in both cases)
+BATCH_SIZE=8
+PRECOMPUTE_BATCH=4
 MAX_SEQ_LEN=512
 
 TEACHER="Qwen/Qwen3-8B"
@@ -37,7 +40,7 @@ if [ ! -f "${DATA_DIR}/teacher_saliency_dolly.pt" ]; then
         --model_name "$TEACHER" \
         --dataset dolly \
         --output_path "${DATA_DIR}/teacher_saliency_dolly.pt" \
-        --batch_size "$BATCH_SIZE" \
+        --batch_size "$PRECOMPUTE_BATCH" \
         --max_seq_len "$MAX_SEQ_LEN" \
         --device "$DEVICE" \
         2>&1 | tee "${LOG_DIR}/precompute_dolly.log"
@@ -51,7 +54,7 @@ if [ ! -f "${DATA_DIR}/teacher_saliency_squad.pt" ]; then
         --model_name "$TEACHER" \
         --dataset squad \
         --output_path "${DATA_DIR}/teacher_saliency_squad.pt" \
-        --batch_size "$BATCH_SIZE" \
+        --batch_size "$PRECOMPUTE_BATCH" \
         --max_seq_len "$MAX_SEQ_LEN" \
         --device "$DEVICE" \
         2>&1 | tee "${LOG_DIR}/precompute_squad.log"

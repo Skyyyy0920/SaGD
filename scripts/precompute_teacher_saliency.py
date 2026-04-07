@@ -51,7 +51,7 @@ def main() -> None:
         args.data_source = {
             "dolly": "databricks/databricks-dolly-15k",
             "squad": "rajpurkar/squad_v2",
-            "samsum": "samsum",
+            "samsum": "knkarthick/samsum",
             "gsm8k": "openai/gsm8k",
         }[args.dataset]
 

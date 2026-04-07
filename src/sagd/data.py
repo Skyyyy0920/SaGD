@@ -336,12 +336,26 @@ class SAMSumDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
 
+        # The original "samsum" dataset has been deprecated.
+        # knkarthick/samsum is a parquet mirror (no remote code needed);
+        # Samsung/samsum is the official one but requires trust_remote_code.
+        def _load_samsum(split: str):
+            for name in ("knkarthick/samsum", "Samsung/samsum"):
+                try:
+                    return load_dataset(name, split=split, trust_remote_code=True)
+                except Exception:
+                    continue
+            raise RuntimeError(
+                "Could not load samsum from any known mirror "
+                "(tried knkarthick/samsum, Samsung/samsum)."
+            )
+
         if subset == "train":
-            raw = load_dataset("samsum", split="train")
+            raw = _load_samsum("train")
         elif subset == "val":
-            raw = load_dataset("samsum", split="validation")
+            raw = _load_samsum("validation")
         elif subset == "test":
-            raw = load_dataset("samsum", split="test")
+            raw = _load_samsum("test")
         else:
             raise ValueError(f"Unknown subset: {subset}. Must be train/val/test")
 

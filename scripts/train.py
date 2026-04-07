@@ -30,7 +30,7 @@ DATASET_CHOICES = ["dolly", "squad", "samsum", "gsm8k"]
 DATASET_HF_NAMES = {
     "dolly": "databricks/databricks-dolly-15k",
     "squad": "rajpurkar/squad_v2",
-    "samsum": "samsum",
+    "samsum": "knkarthick/samsum",
     "gsm8k": "openai/gsm8k",
 }
 

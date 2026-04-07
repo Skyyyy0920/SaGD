@@ -77,8 +77,22 @@ class Trainer:
 
         self.device = config.get("device", "cuda:0")
         self.epochs = config.get("epochs", 3)
-        self.batch_size = config.get("batch_size", 8)
+        self.batch_size = config.get("batch_size", 4)
         self.grad_accum = config.get("gradient_accumulation", 4)
+
+        # SaGD does extra forward passes (noise KL on both teacher + student),
+        # so peak memory ~2× standard KD. Auto-halve batch_size and double
+        # grad_accum to keep effective batch unchanged.
+        if method == "sagd" and self.batch_size > 1:
+            new_bs = max(1, self.batch_size // 2)
+            new_ga = self.grad_accum * (self.batch_size // new_bs)
+            print(
+                f"[SaGD] auto-reducing batch_size {self.batch_size} → {new_bs} "
+                f"and increasing grad_accum {self.grad_accum} → {new_ga} "
+                f"(effective batch unchanged)"
+            )
+            self.batch_size = new_bs
+            self.grad_accum = new_ga
         self.lr = config.get("lr", 2e-5)
         self.weight_decay = config.get("weight_decay", 0.01)
         self.warmup_ratio = config.get("warmup_ratio", 0.03)

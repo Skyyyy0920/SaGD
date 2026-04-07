@@ -97,6 +97,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip_bertscore", action="store_true",
                     help="Skip BERTScore in post-training eval")
     p.add_argument("--log_every", type=int, default=50)
+    p.add_argument("--save_every_n_epochs", type=int, default=0,
+                    help="Save intermediate checkpoint every N epochs. "
+                         "0 (default) = only save student_final.pt.")
 
     return p.parse_args()
 
@@ -193,6 +196,7 @@ def main() -> None:
         "temperature": args.temperature,
         "fp16": args.fp16,
         "log_every": args.log_every,
+        "save_every_n_epochs": args.save_every_n_epochs,
         "teacher_saliency_path": args.teacher_saliency_path,
         "lambda_noise": args.lambda_noise,
         "noise_sigma": args.noise_sigma,

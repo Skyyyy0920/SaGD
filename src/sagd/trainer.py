@@ -100,7 +100,9 @@ class Trainer:
         self.temperature = config.get("temperature", 2.0)
         self.fp16 = config.get("fp16", True)
         self.log_every = config.get("log_every", 50)
-        self.save_every_n_epochs = config.get("save_every_n_epochs", 1)
+        # save_every_n_epochs <= 0 means: only save the final checkpoint
+        # (avoids filling disk with 10x intermediate checkpoints across 80 runs).
+        self.save_every_n_epochs = config.get("save_every_n_epochs", 0)
 
         # Loss functions
         if method == "reverse_kl":
@@ -596,7 +598,10 @@ class Trainer:
             avg_loss = epoch_loss / max(len(epoch_dataloader), 1)
             print(f"Epoch {epoch+1} avg loss: {avg_loss:.4f}")
 
-            if (epoch + 1) % self.save_every_n_epochs == 0:
+            # Only save intermediate checkpoints if explicitly requested
+            # (save_every_n_epochs > 0). Default 0 → only the final
+            # checkpoint is written at end of training.
+            if self.save_every_n_epochs > 0 and (epoch + 1) % self.save_every_n_epochs == 0:
                 ckpt_path = Path(save_dir) / f"student_epoch{epoch+1}.pt"
                 torch.save(self.student.state_dict(), ckpt_path)
 

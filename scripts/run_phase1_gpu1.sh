@@ -13,11 +13,12 @@ export PYTHONPATH="$(pwd)/src:$PYTHONPATH"
 
 # CUDA_VISIBLE_DEVICES maps physical GPU 1 to logical cuda:0
 DEVICE="cuda:0"
-# Non-SaGD methods use batch_size=8; SaGD auto-halves to 4 inside trainer
-# (effective batch = batch_size * grad_accum = 32 in both cases)
-BATCH_SIZE=8
+# Non-SaGD methods use batch_size=4; SaGD auto-halves to 2 inside trainer
+# (effective batch = batch_size * grad_accum = 16 in both cases)
+BATCH_SIZE=4
 PRECOMPUTE_BATCH=4
 MAX_SEQ_LEN=512
+EPOCHS=5
 
 TEACHER="Qwen/Qwen3-8B"
 STUDENT="Qwen/Qwen3-0.6B"
@@ -101,7 +102,7 @@ run_one() {
         --student_model "$STUDENT" \
         --batch_size "$BATCH_SIZE" \
         --max_seq_len "$MAX_SEQ_LEN" \
-        --epochs 10 \
+        --epochs "$EPOCHS" \
         --lr 1e-5 \
         --seed "$SEED" \
         --output_dir "$OUTPUT_DIR" \

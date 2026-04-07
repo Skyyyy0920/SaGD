@@ -131,6 +131,11 @@ def main() -> None:
     assert all(s is not None for s in all_saliency), "Some samples missing saliency"
 
     os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
+
+    # Atomic write: save to temp path then rename. Prevents readers (e.g.,
+    # parallel training scripts polling the same path) from seeing a
+    # half-written file.
+    tmp_path = args.output_path + ".tmp"
     torch.save({
         "saliency": all_saliency,
         "metadata": {
@@ -140,7 +145,8 @@ def main() -> None:
             "n_samples": len(dataset),
             "max_seq_len": args.max_seq_len,
         },
-    }, args.output_path)
+    }, tmp_path)
+    os.replace(tmp_path, args.output_path)  # atomic rename
 
     print(f"Saved {len(all_saliency)} saliency vectors to {args.output_path}")
 

@@ -87,8 +87,8 @@ class Trainer:
             new_bs = max(1, self.batch_size // 2)
             new_ga = self.grad_accum * (self.batch_size // new_bs)
             print(
-                f"[SaGD] auto-reducing batch_size {self.batch_size} → {new_bs} "
-                f"and increasing grad_accum {self.grad_accum} → {new_ga} "
+                f"[SaGD] auto-reducing batch_size {self.batch_size} -> {new_bs} "
+                f"and increasing grad_accum {self.grad_accum} -> {new_ga} "
                 f"(effective batch unchanged)"
             )
             self.batch_size = new_bs
@@ -542,9 +542,8 @@ class Trainer:
                                 pad_token_id=pad_id,
                             )  # (B, max_pl + generated)
 
-                            # Trim to L_orig total length and build masks
-                            gen_out = gen_out[:, :max_pl + max_new]
-                            L_out = gen_out.size(1)
+                            # Trim and build attention mask from non-pad tokens
+                            gen_out = gen_out[:, :max_pl + max(max_new, 1)]
                             gen_mask = (gen_out != pad_id).long()
 
                             # Labels mask: tokens after each sample's prompt are response

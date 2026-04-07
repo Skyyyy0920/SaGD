@@ -670,15 +670,26 @@ class EvalInstructionDataset(Dataset):
             ))
 
     def _load_self_inst(self, tokenizer, max_seq_len, max_samples, seed):
-        """Self-Instruct evaluation set (252 samples)."""
-        raw = load_dataset("yizhongw/self_instruct", "self_instruct", split="train")
+        """Self-Instruct human evaluation set (252 samples, used by DA-KD).
+
+        Uses the ``human_eval`` config of yizhongw/self_instruct.
+        Each row has fields ``instruction`` and ``instances`` (list of dicts
+        with ``input``/``output``).
+        """
+        raw = load_dataset("yizhongw/self_instruct", "human_eval", split="train")
         raw = raw.shuffle(seed=seed)
         if max_samples:
             raw = raw.select(range(min(max_samples, len(raw))))
         for i, row in enumerate(raw):
+            instruction = row.get("instruction", "")
+            instances = row.get("instances", [])
+            if instances and len(instances) > 0:
+                inp = instances[0].get("input", "") or ""
+                out = instances[0].get("output", "") or ""
+            else:
+                inp, out = "", ""
             self.samples.append(self._tokenize_sample(
-                tokenizer, row["prompt"], "",
-                row["completion"], max_seq_len, i,
+                tokenizer, instruction, inp, out, max_seq_len, i,
             ))
 
     def _load_super_natural(self, tokenizer, max_seq_len, max_samples, seed):

@@ -119,12 +119,14 @@ for SEED in "${SEEDS[@]}"; do
     done
 done
 
-# 2) Wait for the dolly saliency cache produced by GPU1
-echo "[GPU3] Waiting for ${DATA_DIR}/teacher_saliency_dolly.pt ..."
-while [ ! -f "${DATA_DIR}/teacher_saliency_dolly.pt" ]; do
+# 2) Wait for the dolly saliency cache produced by GPU1.
+#    Poll the marker file (created by GPU1 *after* the cache write completes),
+#    not the cache file itself, to avoid reading a half-written file.
+echo "[GPU3] Waiting for ${DATA_DIR}/.dolly_saliency_ready ..."
+while [ ! -f "${DATA_DIR}/.dolly_saliency_ready" ]; do
     sleep 30
 done
-echo "[GPU3] dolly saliency found, starting SaGD runs."
+echo "[GPU3] dolly saliency ready, starting SaGD runs."
 
 # 3) Run SaGD across all seeds
 for SEED in "${SEEDS[@]}"; do

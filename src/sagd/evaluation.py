@@ -1,8 +1,9 @@
-"""Evaluation metrics: ROUGE-L, BERTScore, Perplexity, EM/F1, Evidence Concentration."""
+"""Evaluation metrics: ROUGE-L, BERTScore, Perplexity, EM/F1, Evidence Concentration, GSM8K Accuracy."""
 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Union
 
@@ -12,7 +13,17 @@ from rouge_score import rouge_scorer
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
-from sagd.data import InstructionDataset, SquadDataset, normalize_answer
+from sagd.data import (
+    EvalInstructionDataset,
+    GSM8KDataset,
+    InstructionDataset,
+    SAMSumDataset,
+    SquadDataset,
+    normalize_answer,
+)
+
+# Union type for all dataset types
+DatasetType = Union[InstructionDataset, SquadDataset, SAMSumDataset, GSM8KDataset, EvalInstructionDataset]
 
 
 # ---------------------------------------------------------------------------
@@ -22,7 +33,7 @@ from sagd.data import InstructionDataset, SquadDataset, normalize_answer
 def generate_responses(
     model: nn.Module,
     tokenizer: PreTrainedTokenizer,
-    dataset: Union[InstructionDataset, SquadDataset],
+    dataset: DatasetType,
     max_new_tokens: int = 256,
     batch_size: int = 8,
     device: str = "cuda",
@@ -91,9 +102,13 @@ def generate_responses(
             for j, idx in enumerate(batch_indices):
                 gen_ids = outputs[j, max_prompt_len:]
                 generated = tokenizer.decode(gen_ids, skip_special_tokens=True)
-                # Strip to first line — extractive QA answers are short spans,
-                # but models often generate multi-line explanations after the answer.
-                generated = generated.split("\n")[0].strip()
+                # For extractive QA, strip to first line (answers are short spans).
+                # For math reasoning (GSM8K), keep full text so #### pattern is preserved.
+                category = metas[j]["category"]
+                if category not in ("math_reasoning",):
+                    generated = generated.split("\n")[0].strip()
+                else:
+                    generated = generated.strip()
                 results.append({
                     "index": idx,
                     "instruction": metas[j]["instruction"],
@@ -141,7 +156,12 @@ def compute_rouge(responses: list[dict]) -> dict[str, float]:
     scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
     scores = []
     for r in responses:
-        score = scorer.score(r["reference"], r["generated"])
+        ref = r["reference"]
+        gen = r["generated"]
+        # Skip samples with empty references (e.g., VicunaEval eval-only prompts)
+        if not ref or not ref.strip():
+            continue
+        score = scorer.score(ref, gen)
         scores.append({
             "rouge_l_f": score["rougeL"].fmeasure,
             "rouge_l_p": score["rougeL"].precision,
@@ -207,6 +227,65 @@ def compute_exact_match_f1(responses: list[dict]) -> dict[str, float]:
     return {
         "exact_match": sum(em_scores) / n,
         "token_f1": sum(f1_scores) / n,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 3b. GSM8K Accuracy (mathematical reasoning)
+# ---------------------------------------------------------------------------
+
+def _extract_gsm8k_answer(text: str) -> str | None:
+    """Extract the final numeric answer from a GSM8K-style response.
+
+    Looks for patterns like ``#### 42``, ``The answer is 42``, or the last number.
+    """
+    # Try #### pattern first
+    match = re.search(r"####\s*(.+?)(?:\s*$|\n)", text)
+    if match:
+        return match.group(1).strip().replace(",", "")
+
+    # Try "the answer is X" pattern
+    match = re.search(r"(?:the answer is|answer:)\s*([+-]?\d[\d,]*\.?\d*)", text, re.I)
+    if match:
+        return match.group(1).strip().replace(",", "")
+
+    # Fallback: last number in the text
+    numbers = re.findall(r"[+-]?\d[\d,]*\.?\d*", text)
+    if numbers:
+        return numbers[-1].replace(",", "")
+
+    return None
+
+
+def compute_gsm8k_accuracy(responses: list[dict]) -> dict[str, float]:
+    """Compute zero-shot accuracy for GSM8K from pre-generated responses.
+
+    Extracts the final numeric answer from both reference and generated text,
+    then compares them.
+
+    Args:
+        responses: list of dicts with ``"reference"`` and ``"generated"`` keys.
+
+    Returns:
+        ``{"gsm8k_accuracy": float, "n_valid": int}``
+    """
+    correct = 0
+    valid = 0
+
+    for r in responses:
+        ref_answer = _extract_gsm8k_answer(r["reference"])
+        gen_answer = _extract_gsm8k_answer(r["generated"])
+
+        if ref_answer is None:
+            continue
+        valid += 1
+
+        if gen_answer is not None and ref_answer == gen_answer:
+            correct += 1
+
+    return {
+        "gsm8k_accuracy": correct / max(valid, 1),
+        "n_valid": valid,
     }
 
 
@@ -316,7 +395,7 @@ def compute_bertscore(
 def compute_perplexity(
     model: nn.Module,
     tokenizer: PreTrainedTokenizer,
-    dataset: Union[InstructionDataset, SquadDataset],
+    dataset: DatasetType,
     batch_size: int = 8,
     device: str = "cuda",
 ) -> dict[str, float]:
@@ -388,7 +467,7 @@ def compute_perplexity(
 def evaluate_all(
     model: nn.Module,
     tokenizer: PreTrainedTokenizer,
-    dataset: Union[InstructionDataset, SquadDataset],
+    dataset: DatasetType,
     max_new_tokens: int = 256,
     batch_size: int = 8,
     device: str = "cuda",
@@ -398,14 +477,17 @@ def evaluate_all(
 ) -> dict[str, float]:
     """Run all applicable metrics.
 
-    For Dolly: ROUGE-L, BERTScore (optional), Perplexity.
+    For Dolly/instruction-following: ROUGE-L, BERTScore (optional), Perplexity.
     For SQuAD: EM, Token F1, ROUGE-L, Perplexity.
+    For SAMSum: ROUGE-L, Perplexity.
+    For GSM8K: GSM8K accuracy, ROUGE-L, Perplexity.
 
     Generates responses once, then reuses them across text-overlap metrics.
     Perplexity is computed separately (teacher-forced, no generation needed).
 
     Args:
-        dataset_type: ``"dolly"`` or ``"squad"``. Controls which metrics to compute.
+        dataset_type: ``"dolly"``, ``"squad"``, ``"samsum"``, ``"gsm8k"``, or
+            any eval dataset name. Controls which metrics to compute.
 
     Returns dict with all metric keys merged.
     """
@@ -417,7 +499,7 @@ def evaluate_all(
         device=device,
     )
 
-    # 2. ROUGE-L (both datasets)
+    # 2. ROUGE-L (all datasets)
     metrics = compute_rouge(responses)
 
     # 3. EM / F1 (SQuAD only)
@@ -425,7 +507,12 @@ def evaluate_all(
         qa_metrics = compute_exact_match_f1(responses)
         metrics.update(qa_metrics)
 
-    # 4. BERTScore (optional, both datasets)
+    # 4. GSM8K accuracy
+    if dataset_type == "gsm8k":
+        gsm_metrics = compute_gsm8k_accuracy(responses)
+        metrics.update(gsm_metrics)
+
+    # 5. BERTScore (optional)
     if not skip_bertscore:
         try:
             bs_metrics = compute_bertscore(
@@ -435,7 +522,7 @@ def evaluate_all(
         except ImportError:
             print("WARNING: bert-score not installed, skipping BERTScore.")
 
-    # 5. Perplexity
+    # 6. Perplexity
     ppl_metrics = compute_perplexity(
         model, tokenizer, dataset,
         batch_size=batch_size, device=device,
@@ -452,7 +539,7 @@ def evaluate_all(
 def evaluate_rouge(
     model: nn.Module,
     tokenizer: PreTrainedTokenizer,
-    dataset: Union[InstructionDataset, SquadDataset],
+    dataset: DatasetType,
     max_new_tokens: int = 256,
     batch_size: int = 8,
     device: str = "cuda",

@@ -1,7 +1,7 @@
-"""Unified trainer for SaGD and baselines.
+"""Unified trainer for SaGD and all baselines.
 
-Supports three methods: standard_kd, reverse_kl, sagd.
-See CLAUDE.md §2.5 for the complete training flow pseudocode.
+Supports 8 methods: sft, standard_kd, reverse_kl, seqkd, gkd, distillm, dakd, sagd.
+See CLAUDE.md §2.5 for the SaGD training flow pseudocode.
 
 SaGD uses noise KL for implicit Jacobian matching (Srinivas & Fleuret 2018):
   E[KL(f_T(x+ξ) || f_S(x+ξ))] = KL(f_T(x) || f_S(x)) + σ² ||J_T - J_S||²_F + O(σ⁴)
@@ -15,17 +15,35 @@ import os
 from pathlib import Path
 from typing import Any
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from sagd.data import InstructionDataset, collate_fn
-from sagd.losses import ReverseKLLoss, StandardKDLoss
+from sagd.losses import (
+    BDLLoss,
+    JSDLoss,
+    ReverseKLLoss,
+    SFTLoss,
+    SkewKLLoss,
+    StandardKDLoss,
+)
 from sagd.saliency import SaliencyComputer
 
-METHODS = {"standard_kd", "reverse_kl", "sagd"}
+METHODS = {
+    "standard_kd",    # Forward KL (Hinton, 2015)
+    "reverse_kl",     # Reverse KL / MiniLLM (Gu et al., 2024)
+    "sft",            # Supervised fine-tuning (no teacher)
+    "seqkd",          # Sequence-level KD (Kim & Rush, 2016) — SFT on teacher outputs
+    "gkd",            # Generalized KD with JSD (Agarwal et al., 2023)
+    "distillm",       # DistiLLM with Skew KL (Ko et al., 2024)
+    "dakd",           # DA-KD with BDL (He et al., 2025)
+    "sagd",           # Our method
+}
 
 
 class Trainer:
@@ -73,12 +91,36 @@ class Trainer:
         # Loss functions
         if method == "reverse_kl":
             self.kl_loss_fn = ReverseKLLoss(temperature=self.temperature)
+        elif method == "sft" or method == "seqkd":
+            self.sft_loss_fn = SFTLoss()
+            self.kl_loss_fn = None  # not used
+        elif method == "gkd":
+            self.kl_loss_fn = JSDLoss(
+                temperature=self.temperature,
+                beta=config.get("gkd_beta", 0.5),
+            )
+            # On-policy probability: fraction of steps using student-generated outputs
+            self.gkd_on_policy_prob = config.get("gkd_on_policy_prob", 0.0)
+        elif method == "distillm":
+            self.kl_loss_fn = SkewKLLoss(
+                temperature=self.temperature,
+                alpha=config.get("distillm_alpha", 0.5),
+            )
+        elif method == "dakd":
+            self.kl_loss_fn = BDLLoss(
+                temperature=self.temperature,
+                bdl_lambda=config.get("bdl_lambda", 0.9),
+            )
         else:
             self.kl_loss_fn = StandardKDLoss(temperature=self.temperature)
 
         # SaGD components — only initialized when method == "sagd"
         self.saliency_computer: SaliencyComputer | None = None
         self.teacher_saliency_cache: list[torch.Tensor] | None = None
+
+        # DA-KD components — DiffUp strategy
+        if method == "dakd":
+            self.dakd_tau = config.get("dakd_tau", 0.1)  # stratified mixing
 
         if method == "sagd":
             sal_temp = config.get("saliency_temperature", 2.0)
@@ -93,6 +135,84 @@ class Trainer:
             assert cache_path is not None, "sagd requires teacher_saliency_path"
             cache = torch.load(cache_path, map_location="cpu", weights_only=False)
             self.teacher_saliency_cache = cache["saliency"]
+
+    def _compute_dakd_subset(
+        self,
+        dataloader: DataLoader,
+        epoch: int,
+    ) -> Subset | None:
+        """DA-KD DiffUp: compute DDS scores and select a subset for this epoch.
+
+        DDS(x) = L_student(x) / L_teacher(x), where L is cross-entropy loss.
+        Selection ratio decays with cosine schedule: r = 0.5*(cos(πe/E) + 1).
+
+        Returns:
+            Subset of self.dataset, or None if epoch==0 (use full dataset).
+        """
+        if epoch == 0:
+            return None  # first epoch uses full dataset
+
+        E = self.epochs
+        r = 0.5 * (math.cos(math.pi * epoch / E) + 1)  # cosine decay
+        r = max(r, 0.1)  # minimum 10% of data
+
+        # Compute per-sample cross-entropy for teacher and student
+        self.student.eval()
+        teacher_losses = []
+        student_losses = []
+
+        with torch.no_grad():
+            for batch in tqdm(dataloader, desc=f"DDS scoring (epoch {epoch+1})", leave=False):
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                labels_mask = batch["labels_mask"].to(self.device)
+
+                t_out = self.teacher(input_ids=input_ids, attention_mask=attention_mask)
+                s_out = self.student(input_ids=input_ids, attention_mask=attention_mask)
+
+                # Per-sample cross-entropy on response tokens
+                for logits, losses_list in [(t_out.logits.float(), teacher_losses),
+                                            (s_out.logits.float(), student_losses)]:
+                    shift_logits = logits[:, :-1, :]
+                    shift_labels = input_ids[:, 1:]
+                    mask = labels_mask[:, 1:].float()
+
+                    log_probs = F.log_softmax(shift_logits, dim=-1)
+                    token_nll = -log_probs.gather(
+                        dim=-1, index=shift_labels.unsqueeze(-1)
+                    ).squeeze(-1)  # (B, L-1)
+
+                    per_sample = (token_nll * mask).sum(dim=-1) / mask.sum(dim=-1).clamp(min=1)
+                    losses_list.extend(per_sample.cpu().tolist())
+
+        self.student.train()
+
+        teacher_losses = torch.tensor(teacher_losses)
+        student_losses = torch.tensor(student_losses)
+
+        # DDS = student_loss / teacher_loss (high = student struggles, teacher confident)
+        dds = student_losses / teacher_losses.clamp(min=1e-6)
+
+        # Sort by DDS descending
+        n_total = len(dds)
+        n_select = max(int(n_total * r), 1)
+        sorted_indices = dds.argsort(descending=True)
+
+        # Stratified sampling: split into high-DDS and low-DDS partitions
+        high_indices = sorted_indices[:n_select].tolist()
+        low_indices = sorted_indices[n_select:].tolist()
+
+        tau = self.dakd_tau
+        n_from_high = max(int((1 - tau) * len(high_indices)), 1)
+        n_from_low = max(int(tau * len(high_indices)), 0)  # same total as n_select
+
+        import random
+        rng = random.Random(epoch)  # deterministic per epoch
+        selected_high = rng.sample(high_indices, min(n_from_high, len(high_indices)))
+        selected_low = rng.sample(low_indices, min(n_from_low, len(low_indices))) if low_indices else []
+
+        selected = selected_high + selected_low
+        return Subset(self.dataset, selected)
 
     def _compute_per_sample_kl(
         self,
@@ -264,9 +384,22 @@ class Trainer:
         global_step = 0
 
         for epoch in range(self.epochs):
+            # DA-KD DiffUp: select data subset for this epoch
+            if self.method == "dakd" and epoch > 0:
+                subset = self._compute_dakd_subset(dataloader, epoch)
+                if subset is not None:
+                    epoch_dataloader = DataLoader(
+                        subset, batch_size=self.batch_size,
+                        shuffle=True, collate_fn=collate_fn, drop_last=True,
+                    )
+                else:
+                    epoch_dataloader = dataloader
+            else:
+                epoch_dataloader = dataloader
+
             self.student.train()
             epoch_loss = 0.0
-            pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{self.epochs}")
+            pbar = tqdm(epoch_dataloader, desc=f"Epoch {epoch+1}/{self.epochs}")
 
             for step, batch in enumerate(pbar):
                 input_ids = batch["input_ids"].to(self.device)          # (B, L)
@@ -274,12 +407,16 @@ class Trainer:
                 labels_mask = batch["labels_mask"].to(self.device)       # (B, L)
                 indices = batch["index"]                                 # (B,)
 
-                # Teacher forward (frozen, no_grad)
-                with torch.no_grad():
-                    t_out = self.teacher(
-                        input_ids=input_ids, attention_mask=attention_mask,
-                    )
-                    t_logits = t_out.logits.float()  # (B, L, V)
+                # SFT doesn't need teacher forward
+                if self.method == "sft":
+                    t_logits = None
+                else:
+                    # Teacher forward (frozen, no_grad)
+                    with torch.no_grad():
+                        t_out = self.teacher(
+                            input_ids=input_ids, attention_mask=attention_mask,
+                        )
+                        t_logits = t_out.logits.float()  # (B, L, V)
 
                 # Student forward
                 with torch.amp.autocast("cuda", enabled=self.fp16):
@@ -290,7 +427,21 @@ class Trainer:
 
                     step_stats: dict[str, Any] = {"step": global_step, "epoch": epoch}
 
-                    if self.method == "sagd" and global_step % self.sagd_every_n == 0:
+                    if self.method == "sft":
+                        # SFT: cross-entropy on ground truth labels
+                        loss = self.sft_loss_fn(s_logits, input_ids, labels_mask)
+
+                    elif self.method == "seqkd":
+                        # SeqKD (Kim & Rush, 2016): SFT on teacher's argmax tokens.
+                        # Replace target tokens with teacher's greedy predictions
+                        # at response positions (prompt tokens stay as ground truth).
+                        teacher_tokens = t_logits.argmax(dim=-1)  # (B, L)
+                        seqkd_targets = torch.where(
+                            labels_mask.bool(), teacher_tokens, input_ids,
+                        )  # (B, L)
+                        loss = self.sft_loss_fn(s_logits, seqkd_targets, labels_mask)
+
+                    elif self.method == "sagd" and global_step % self.sagd_every_n == 0:
                         # === SaGD step ===
 
                         # 1. Per-sample KL on clean input
@@ -334,15 +485,59 @@ class Trainer:
                             "sagd/embed_norm": noise_stats["embed_norm"],
                             "sagd/noise_ratio": noise_stats["noise_ratio"],
                         })
+                    elif self.method == "gkd" and self.gkd_on_policy_prob > 0 and torch.rand(1).item() < self.gkd_on_policy_prob:
+                        # GKD on-policy: generate student outputs, then compute JSD
+                        # on student-generated sequences (both teacher and student
+                        # do a forward pass on the student's generated tokens).
+                        with torch.no_grad():
+                            prompt_lens = (labels_mask == 0).sum(dim=-1)  # (B,)
+                            max_prompt = prompt_lens.max().item()
+                            prompt_ids = input_ids[:, :max_prompt]
+                            prompt_mask = attention_mask[:, :max_prompt]
+
+                            gen_out = self.student.generate(
+                                input_ids=prompt_ids,
+                                attention_mask=prompt_mask,
+                                max_new_tokens=input_ids.size(1) - max_prompt,
+                                do_sample=True,
+                                temperature=1.0,
+                                pad_token_id=self.tokenizer.pad_token_id or 0,
+                            )  # (B, L')
+
+                            # Pad/trim to same length
+                            L_gen = gen_out.size(1)
+                            L_orig = input_ids.size(1)
+                            if L_gen < L_orig:
+                                gen_out = F.pad(gen_out, (0, L_orig - L_gen), value=0)
+                                gen_mask = F.pad(torch.ones(gen_out.size(0), L_gen, device=self.device, dtype=torch.long), (0, L_orig - L_gen), value=0)
+                            else:
+                                gen_out = gen_out[:, :L_orig]
+                                gen_mask = torch.ones_like(gen_out)
+
+                            # Labels mask: everything after prompt is response
+                            gen_labels = torch.zeros_like(gen_out)
+                            for bi in range(gen_out.size(0)):
+                                pl = prompt_lens[bi].item()
+                                gen_labels[bi, pl:] = 1
+
+                            # Teacher forward on student-generated tokens
+                            t_out_gen = self.teacher(input_ids=gen_out, attention_mask=gen_mask)
+                            t_logits_gen = t_out_gen.logits.float()
+
+                        # Student forward on its own generated tokens (differentiable)
+                        s_out_gen = self.student(input_ids=gen_out, attention_mask=gen_mask)
+                        s_logits_gen = s_out_gen.logits.float()
+                        loss = self.kl_loss_fn(t_logits_gen, s_logits_gen, gen_labels)
+
                     else:
-                        # Standard or non-SaGD-step
+                        # Standard KD, Reverse KL, GKD (off-policy), DistiLLM, DA-KD, or non-SaGD-step
                         loss = self.kl_loss_fn(t_logits, s_logits, labels_mask)
 
                 # Gradient accumulation
                 loss_scaled = loss / self.grad_accum
                 scaler.scale(loss_scaled).backward()
 
-                if (step + 1) % self.grad_accum == 0 or (step + 1) == len(dataloader):
+                if (step + 1) % self.grad_accum == 0 or (step + 1) == len(epoch_dataloader):
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(
                         self.student.parameters(), self.max_grad_norm,
@@ -366,7 +561,7 @@ class Trainer:
                 global_step += 1
 
             # End of epoch
-            avg_loss = epoch_loss / max(len(dataloader), 1)
+            avg_loss = epoch_loss / max(len(epoch_dataloader), 1)
             print(f"Epoch {epoch+1} avg loss: {avg_loss:.4f}")
 
             if (epoch + 1) % self.save_every_n_epochs == 0:

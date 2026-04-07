@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Main training entry point for SaGD knowledge distillation."""
+"""Main training entry point for SaGD knowledge distillation.
+
+Supports all baseline methods from DA-KD (ICML 2025) comparison:
+  SFT, KD-KL (standard_kd), KD-RKL (reverse_kl), SeqKD, GKD, DistiLLM, DA-KD, SaGD.
+
+Supports datasets: dolly, squad, samsum, gsm8k.
+"""
 
 from __future__ import annotations
 
@@ -13,10 +19,20 @@ import torch
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from sagd.data import InstructionDataset, SquadDataset
+from sagd.data import GSM8KDataset, InstructionDataset, SAMSumDataset, SquadDataset
 from sagd.evaluation import evaluate_all
 from sagd.models import load_student, load_teacher
 from sagd.trainer import METHODS, Trainer
+
+
+DATASET_CHOICES = ["dolly", "squad", "samsum", "gsm8k"]
+
+DATASET_HF_NAMES = {
+    "dolly": "databricks/databricks-dolly-15k",
+    "squad": "rajpurkar/squad_v2",
+    "samsum": "samsum",
+    "gsm8k": "openai/gsm8k",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,8 +46,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--student_model", type=str, default="Qwen/Qwen3-0.6B")
 
     # Data
-    p.add_argument("--dataset", type=str, default="dolly", choices=["dolly", "squad"],
-                    help="Dataset: 'dolly' (Dolly-15K) or 'squad' (SQuAD 2.0)")
+    p.add_argument("--dataset", type=str, default="dolly", choices=DATASET_CHOICES,
+                    help="Dataset for training")
     p.add_argument("--data_source", type=str, default=None,
                     help="HF dataset name. Auto-set from --dataset if not provided.")
     p.add_argument("--max_seq_len", type=int, default=512)
@@ -60,6 +76,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sagd_tau_w", type=float, default=1.0)
     p.add_argument("--saliency_temperature", type=float, default=2.0)
 
+    # GKD-specific
+    p.add_argument("--gkd_beta", type=float, default=0.5,
+                    help="JSD mixing coefficient for GKD")
+    p.add_argument("--gkd_on_policy_prob", type=float, default=0.0,
+                    help="Probability of using on-policy (student-generated) sequences for GKD")
+
+    # DistiLLM-specific
+    p.add_argument("--distillm_alpha", type=float, default=0.5,
+                    help="Skew coefficient for DistiLLM")
+
+    # DA-KD-specific
+    p.add_argument("--bdl_lambda", type=float, default=0.9,
+                    help="BDL mixing coefficient for DA-KD")
+
     # Output
     p.add_argument("--output_dir", type=str, default="outputs/")
     p.add_argument("--device", type=str, default="cuda:0")
@@ -71,6 +101,44 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def create_dataset(args, tokenizer, subset="train"):
+    """Create the appropriate dataset based on --dataset flag."""
+    if args.dataset == "squad":
+        return SquadDataset(
+            tokenizer=tokenizer,
+            dataset_name=args.data_source,
+            max_seq_len=args.max_seq_len,
+            max_samples=args.max_train_samples if subset == "train" else 500,
+            seed=args.seed,
+            subset=subset,
+        )
+    elif args.dataset == "samsum":
+        return SAMSumDataset(
+            tokenizer=tokenizer,
+            max_seq_len=args.max_seq_len,
+            max_samples=args.max_train_samples if subset == "train" else None,
+            seed=args.seed,
+            subset=subset,
+        )
+    elif args.dataset == "gsm8k":
+        return GSM8KDataset(
+            tokenizer=tokenizer,
+            max_seq_len=args.max_seq_len,
+            max_samples=args.max_train_samples if subset == "train" else None,
+            seed=args.seed,
+            subset=subset,
+        )
+    else:  # dolly
+        return InstructionDataset(
+            tokenizer=tokenizer,
+            dataset_name=args.data_source,
+            max_seq_len=args.max_seq_len,
+            max_samples=args.max_train_samples if subset == "train" else 500,
+            seed=args.seed,
+            subset=subset,
+        )
+
+
 def main() -> None:
     args = parse_args()
 
@@ -79,10 +147,7 @@ def main() -> None:
 
     # Auto-set data_source from --dataset if not explicitly provided
     if args.data_source is None:
-        args.data_source = {
-            "dolly": "databricks/databricks-dolly-15k",
-            "squad": "rajpurkar/squad_v2",
-        }[args.dataset]
+        args.data_source = DATASET_HF_NAMES[args.dataset]
 
     # Reproducibility
     torch.manual_seed(args.seed)
@@ -99,29 +164,18 @@ def main() -> None:
     print(f"Save dir: {save_dir}")
 
     # Load models
-    teacher, t_tokenizer = load_teacher(args.teacher_model, args.device)
+    # SFT is the only method that doesn't need a teacher
+    if args.method == "sft":
+        teacher, t_tokenizer = None, None
+    else:
+        teacher, t_tokenizer = load_teacher(args.teacher_model, args.device)
+
     student, s_tokenizer = load_student(args.student_model, args.device)
 
-    # Use student tokenizer for data (student is the one being trained)
-    if args.dataset == "squad":
-        dataset = SquadDataset(
-            tokenizer=s_tokenizer,
-            dataset_name=args.data_source,
-            max_seq_len=args.max_seq_len,
-            max_samples=args.max_train_samples,
-            seed=args.seed,
-            subset="train",
-        )
+    # Use student tokenizer for data
+    dataset = create_dataset(args, s_tokenizer, subset="train")
+    if hasattr(dataset, 'span_mapping_rate'):
         print(f"Answer span mapping rate: {dataset.span_mapping_rate:.1%}")
-    else:
-        dataset = InstructionDataset(
-            tokenizer=s_tokenizer,
-            dataset_name=args.data_source,
-            max_seq_len=args.max_seq_len,
-            max_samples=args.max_train_samples,
-            seed=args.seed,
-            subset="train",
-        )
     print(f"Dataset size: {len(dataset)}")
 
     # Config dict
@@ -145,6 +199,10 @@ def main() -> None:
         "sagd_every_n_steps": args.sagd_every_n_steps,
         "sagd_tau_w": args.sagd_tau_w,
         "saliency_temperature": args.saliency_temperature,
+        "gkd_beta": args.gkd_beta,
+        "gkd_on_policy_prob": args.gkd_on_policy_prob,
+        "distillm_alpha": args.distillm_alpha,
+        "bdl_lambda": args.bdl_lambda,
     }
 
     # Save config
@@ -158,24 +216,7 @@ def main() -> None:
     # Evaluate
     if not args.skip_eval:
         print("Evaluating...")
-        if args.dataset == "squad":
-            eval_dataset = SquadDataset(
-                tokenizer=s_tokenizer,
-                dataset_name=args.data_source,
-                max_seq_len=args.max_seq_len,
-                max_samples=500,
-                seed=args.seed,
-                subset="test",
-            )
-        else:
-            eval_dataset = InstructionDataset(
-                tokenizer=s_tokenizer,
-                dataset_name=args.data_source,
-                max_seq_len=args.max_seq_len,
-                max_samples=500,
-                seed=args.seed,
-                subset="test",
-            )
+        eval_dataset = create_dataset(args, s_tokenizer, subset="test")
         max_new = 32 if args.dataset == "squad" else 256
         metrics = evaluate_all(
             student, s_tokenizer, eval_dataset,
@@ -188,6 +229,8 @@ def main() -> None:
         if "exact_match" in metrics:
             print(f"Exact Match: {metrics['exact_match']:.4f}")
             print(f"Token F1:    {metrics['token_f1']:.4f}")
+        if "gsm8k_accuracy" in metrics:
+            print(f"GSM8K Acc:   {metrics['gsm8k_accuracy']:.4f}")
         if "bertscore_f" in metrics:
             print(f"BERTScore F1: {metrics['bertscore_f']:.4f}")
         print(f"Perplexity:  {metrics['perplexity']:.2f}")

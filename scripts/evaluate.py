@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """Standalone evaluation script for trained student models.
 
-Computes ROUGE-L, BERTScore (optional), Perplexity, and for SQuAD: EM/F1.
-Optionally saves pre-generated responses to JSONL for later GPT-as-Judge use.
+Computes ROUGE-L, BERTScore (optional), Perplexity, and dataset-specific metrics:
+  - SQuAD: EM, Token F1
+  - GSM8K: Accuracy
+  - SAMSum/Dolly/Instruction: ROUGE-L
+
+Supports evaluation on multiple instruction-following benchmarks (DA-KD style):
+  dolly_eval, self_inst, super_natural, unnatural, vicuna_eval
 """
 
 from __future__ import annotations
@@ -16,23 +21,35 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from sagd.data import InstructionDataset, SquadDataset
+from sagd.data import (
+    EvalInstructionDataset,
+    GSM8KDataset,
+    InstructionDataset,
+    SAMSumDataset,
+    SquadDataset,
+)
 from sagd.evaluation import evaluate_all, generate_responses, save_responses
 from sagd.models import load_student
+
+
+DATASET_CHOICES = [
+    "dolly", "squad", "samsum", "gsm8k",
+    "dolly_eval", "self_inst", "super_natural", "unnatural", "vicuna_eval",
+]
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate student model")
     p.add_argument("--student_model", type=str, default="Qwen/Qwen3-0.6B")
     p.add_argument("--student_ckpt", type=str, required=True)
-    p.add_argument("--dataset", type=str, default="dolly", choices=["dolly", "squad"],
-                    help="Dataset: 'dolly' (Dolly-15K) or 'squad' (SQuAD 2.0)")
+    p.add_argument("--dataset", type=str, default="dolly", choices=DATASET_CHOICES,
+                    help="Dataset for evaluation")
     p.add_argument("--data_source", type=str, default=None,
                     help="HF dataset name. Auto-set from --dataset if not provided.")
     p.add_argument("--max_seq_len", type=int, default=512)
     p.add_argument("--max_samples", type=int, default=500)
     p.add_argument("--max_new_tokens", type=int, default=None,
-                    help="Max tokens to generate. Default: 32 for squad, 256 for dolly.")
+                    help="Max tokens to generate. Default: 32 for squad, 256 otherwise.")
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--subset", type=str, default="test",
                     choices=["train", "val", "test"])
@@ -48,14 +65,57 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def create_eval_dataset(args, tokenizer):
+    """Create evaluation dataset."""
+    # Eval-only instruction datasets (DA-KD benchmarks)
+    eval_only_datasets = {"dolly_eval", "self_inst", "super_natural", "unnatural", "vicuna_eval"}
+    if args.dataset in eval_only_datasets:
+        return EvalInstructionDataset(
+            tokenizer=tokenizer,
+            eval_name=args.dataset,
+            max_seq_len=args.max_seq_len,
+            max_samples=args.max_samples,
+            seed=args.seed,
+        )
+
+    if args.dataset == "squad":
+        return SquadDataset(
+            tokenizer=tokenizer,
+            dataset_name=args.data_source or "rajpurkar/squad_v2",
+            max_seq_len=args.max_seq_len,
+            max_samples=args.max_samples,
+            seed=args.seed,
+            subset=args.subset,
+        )
+    elif args.dataset == "samsum":
+        return SAMSumDataset(
+            tokenizer=tokenizer,
+            max_seq_len=args.max_seq_len,
+            max_samples=args.max_samples,
+            seed=args.seed,
+            subset=args.subset,
+        )
+    elif args.dataset == "gsm8k":
+        return GSM8KDataset(
+            tokenizer=tokenizer,
+            max_seq_len=args.max_seq_len,
+            max_samples=args.max_samples,
+            seed=args.seed,
+            subset=args.subset,
+        )
+    else:  # dolly
+        return InstructionDataset(
+            tokenizer=tokenizer,
+            dataset_name=args.data_source or "databricks/databricks-dolly-15k",
+            max_seq_len=args.max_seq_len,
+            max_samples=args.max_samples,
+            seed=args.seed,
+            subset=args.subset,
+        )
+
+
 def main() -> None:
     args = parse_args()
-
-    if args.data_source is None:
-        args.data_source = {
-            "dolly": "databricks/databricks-dolly-15k",
-            "squad": "rajpurkar/squad_v2",
-        }[args.dataset]
 
     if args.max_new_tokens is None:
         args.max_new_tokens = 32 if args.dataset == "squad" else 256
@@ -68,24 +128,15 @@ def main() -> None:
     student.load_state_dict(state_dict)
     student.eval()
 
-    if args.dataset == "squad":
-        dataset = SquadDataset(
-            tokenizer=tokenizer,
-            dataset_name=args.data_source,
-            max_seq_len=args.max_seq_len,
-            max_samples=args.max_samples,
-            seed=args.seed,
-            subset=args.subset,
-        )
+    dataset = create_eval_dataset(args, tokenizer)
+    print(f"Evaluating on {args.dataset} ({len(dataset)} samples)")
+
+    # Determine dataset_type for metric selection
+    eval_only = {"dolly_eval", "self_inst", "super_natural", "unnatural", "vicuna_eval"}
+    if args.dataset in eval_only:
+        dataset_type = "dolly"  # instruction-following → ROUGE-L
     else:
-        dataset = InstructionDataset(
-            tokenizer=tokenizer,
-            dataset_name=args.data_source,
-            max_seq_len=args.max_seq_len,
-            max_samples=args.max_samples,
-            seed=args.seed,
-            subset=args.subset,
-        )
+        dataset_type = args.dataset
 
     # Run all metrics
     metrics = evaluate_all(
@@ -95,13 +146,15 @@ def main() -> None:
         device=args.device,
         skip_bertscore=args.skip_bertscore,
         bertscore_model=args.bertscore_model,
-        dataset_type=args.dataset,
+        dataset_type=dataset_type,
     )
 
     # Print results
     if "exact_match" in metrics:
         print(f"Exact Match:  {metrics['exact_match']:.4f}")
         print(f"Token F1:     {metrics['token_f1']:.4f}")
+    if "gsm8k_accuracy" in metrics:
+        print(f"GSM8K Acc:    {metrics['gsm8k_accuracy']:.4f}")
     print(f"ROUGE-L F1:   {metrics['rouge_l_f']:.4f}")
     print(f"ROUGE-L P:    {metrics['rouge_l_p']:.4f}")
     print(f"ROUGE-L R:    {metrics['rouge_l_r']:.4f}")
@@ -111,6 +164,9 @@ def main() -> None:
         print(f"BERTScore R:  {metrics['bertscore_r']:.4f}")
     print(f"Perplexity:   {metrics['perplexity']:.2f}")
     print(f"Avg NLL:      {metrics['avg_loss']:.4f}")
+
+    # Add dataset name to metrics
+    metrics["dataset"] = args.dataset
 
     # Save metrics
     if args.output_path:

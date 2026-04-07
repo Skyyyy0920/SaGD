@@ -19,7 +19,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from sagd.data import InstructionDataset, SquadDataset, collate_fn
+from sagd.data import GSM8KDataset, InstructionDataset, SAMSumDataset, SquadDataset, collate_fn
 from sagd.models import load_teacher
 from sagd.saliency import SaliencyComputer
 
@@ -30,8 +30,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tokenizer_name", type=str, default=None,
                     help="Tokenizer to use. Defaults to --model_name. "
                          "For cross-arch experiments, set to the STUDENT model name.")
-    p.add_argument("--dataset", type=str, default="dolly", choices=["dolly", "squad"],
-                    help="Dataset: 'dolly' (Dolly-15K) or 'squad' (SQuAD 2.0)")
+    p.add_argument("--dataset", type=str, default="dolly",
+                    choices=["dolly", "squad", "samsum", "gsm8k"],
+                    help="Dataset: 'dolly', 'squad', 'samsum', or 'gsm8k'")
     p.add_argument("--data_source", type=str, default=None,
                     help="HF dataset name. Auto-set from --dataset if not provided.")
     p.add_argument("--output_path", type=str, default="data/teacher_saliency.pt")
@@ -50,6 +51,8 @@ def main() -> None:
         args.data_source = {
             "dolly": "databricks/databricks-dolly-15k",
             "squad": "rajpurkar/squad_v2",
+            "samsum": "samsum",
+            "gsm8k": "openai/gsm8k",
         }[args.dataset]
 
     torch.manual_seed(args.seed)
@@ -70,6 +73,22 @@ def main() -> None:
         dataset = SquadDataset(
             tokenizer=tokenizer,
             dataset_name=args.data_source,
+            max_seq_len=args.max_seq_len,
+            max_samples=args.max_samples,
+            seed=args.seed,
+            subset="train",
+        )
+    elif args.dataset == "samsum":
+        dataset = SAMSumDataset(
+            tokenizer=tokenizer,
+            max_seq_len=args.max_seq_len,
+            max_samples=args.max_samples,
+            seed=args.seed,
+            subset="train",
+        )
+    elif args.dataset == "gsm8k":
+        dataset = GSM8KDataset(
+            tokenizer=tokenizer,
             max_seq_len=args.max_seq_len,
             max_samples=args.max_samples,
             seed=args.seed,

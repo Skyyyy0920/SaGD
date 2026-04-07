@@ -1,10 +1,16 @@
-"""Datasets for sequence-level KD: Dolly-15K and SQuAD 2.0.
+"""Datasets for sequence-level KD.
 
-Loads data from HuggingFace, tokenizes into [prompt | response] sequences,
-provides masks distinguishing prompt (labels_mask=0) from response (labels_mask=1).
+Training datasets:
+  - InstructionDataset: Dolly-15K instruction following
+  - SquadDataset: SQuAD 2.0 extractive QA
+  - SAMSumDataset: SAMSum dialogue summarization
+  - GSM8KDataset: GSM8K mathematical reasoning
 
-SQuAD 2.0 additionally tracks answer span token positions for evidence
-concentration evaluation.
+Evaluation-only datasets (for instruction-following benchmarks, aligned with DA-KD):
+  - EvalInstructionDataset: Generic loader for SelfInst, Super-Natural,
+    Unnatural, VicunaEval, DollyEval
+
+All datasets tokenize into [prompt | response] sequences with labels_mask.
 """
 
 from __future__ import annotations
@@ -306,6 +312,435 @@ class SquadDataset(Dataset):
     def span_mapping_rate(self) -> float:
         """Fraction of samples with successfully mapped answer spans."""
         return self._n_span_mapped / max(len(self.samples), 1)
+
+
+class SAMSumDataset(Dataset):
+    """SAMSum dialogue summarization dataset.
+
+    Args:
+        tokenizer: HuggingFace tokenizer.
+        max_seq_len: Maximum sequence length.
+        max_samples: Limit number of samples (None = all).
+        seed: Random seed for shuffling.
+        subset: ``"train"``, ``"val"`` (from HF validation), or ``"test"`` (from HF test).
+    """
+
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        max_seq_len: int = 512,
+        max_samples: int | None = None,
+        seed: int = 42,
+        subset: str = "train",
+    ) -> None:
+        self.tokenizer = tokenizer
+        self.max_seq_len = max_seq_len
+
+        if subset == "train":
+            raw = load_dataset("samsum", split="train")
+        elif subset == "val":
+            raw = load_dataset("samsum", split="validation")
+        elif subset == "test":
+            raw = load_dataset("samsum", split="test")
+        else:
+            raise ValueError(f"Unknown subset: {subset}. Must be train/val/test")
+
+        raw = raw.shuffle(seed=seed)
+
+        if max_samples is not None:
+            raw = raw.select(range(min(max_samples, len(raw))))
+
+        self.samples: list[dict[str, Any]] = []
+        for i, row in enumerate(raw):
+            dialogue = row["dialogue"]
+            summary = row["summary"]
+            prompt_str = (
+                "Summarize the following dialogue.\n\n"
+                f"### Dialogue:\n{dialogue}\n\n"
+                "### Summary:\n"
+            )
+            full_str = prompt_str + summary
+
+            prompt_enc = tokenizer(
+                prompt_str, add_special_tokens=True, truncation=True,
+                max_length=max_seq_len,
+            )
+            full_enc = tokenizer(
+                full_str, add_special_tokens=True, truncation=True,
+                max_length=max_seq_len, padding=False,
+            )
+
+            input_ids = full_enc["input_ids"]
+            attention_mask = full_enc["attention_mask"]
+            prompt_len = len(prompt_enc["input_ids"])
+            seq_len = len(input_ids)
+
+            labels_mask = [0] * min(prompt_len, seq_len) + [1] * max(0, seq_len - prompt_len)
+
+            self.samples.append({
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels_mask": labels_mask,
+                "index": i,
+                "instruction": dialogue,
+                "response": summary,
+            })
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        s = self.samples[idx]
+        return {
+            "input_ids": torch.tensor(s["input_ids"], dtype=torch.long),
+            "attention_mask": torch.tensor(s["attention_mask"], dtype=torch.long),
+            "labels_mask": torch.tensor(s["labels_mask"], dtype=torch.long),
+            "index": torch.tensor(s["index"], dtype=torch.long),
+        }
+
+    def get_metadata(self, idx: int) -> dict[str, str]:
+        s = self.samples[idx]
+        return {
+            "category": "summarization",
+            "instruction": s["instruction"],
+            "response": s["response"],
+        }
+
+
+class GSM8KDataset(Dataset):
+    """GSM8K mathematical reasoning dataset.
+
+    Answer is the final numeric value after ``####``.
+
+    Args:
+        tokenizer: HuggingFace tokenizer.
+        max_seq_len: Maximum sequence length.
+        max_samples: Limit number of samples (None = all).
+        seed: Random seed for shuffling.
+        subset: ``"train"`` or ``"test"`` (from HF test split).
+    """
+
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        max_seq_len: int = 512,
+        max_samples: int | None = None,
+        seed: int = 42,
+        subset: str = "train",
+    ) -> None:
+        self.tokenizer = tokenizer
+        self.max_seq_len = max_seq_len
+
+        if subset == "train":
+            raw = load_dataset("openai/gsm8k", "main", split="train")
+        elif subset in ("val", "test"):
+            raw = load_dataset("openai/gsm8k", "main", split="test")
+        else:
+            raise ValueError(f"Unknown subset: {subset}. Must be train/val/test")
+
+        raw = raw.shuffle(seed=seed)
+
+        if max_samples is not None:
+            raw = raw.select(range(min(max_samples, len(raw))))
+
+        self.samples: list[dict[str, Any]] = []
+        for i, row in enumerate(raw):
+            question = row["question"]
+            answer_full = row["answer"]
+            # Extract final answer after ####
+            if "####" in answer_full:
+                final_answer = answer_full.split("####")[-1].strip()
+            else:
+                final_answer = answer_full.strip()
+
+            prompt_str = (
+                "Solve the following math problem step by step.\n\n"
+                f"### Question:\n{question}\n\n"
+                "### Answer:\n"
+            )
+            full_str = prompt_str + answer_full
+
+            prompt_enc = tokenizer(
+                prompt_str, add_special_tokens=True, truncation=True,
+                max_length=max_seq_len,
+            )
+            full_enc = tokenizer(
+                full_str, add_special_tokens=True, truncation=True,
+                max_length=max_seq_len, padding=False,
+            )
+
+            input_ids = full_enc["input_ids"]
+            attention_mask = full_enc["attention_mask"]
+            prompt_len = len(prompt_enc["input_ids"])
+            seq_len = len(input_ids)
+
+            labels_mask = [0] * min(prompt_len, seq_len) + [1] * max(0, seq_len - prompt_len)
+
+            self.samples.append({
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels_mask": labels_mask,
+                "index": i,
+                "instruction": question,
+                "response": answer_full,
+                "final_answer": final_answer,
+            })
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        s = self.samples[idx]
+        return {
+            "input_ids": torch.tensor(s["input_ids"], dtype=torch.long),
+            "attention_mask": torch.tensor(s["attention_mask"], dtype=torch.long),
+            "labels_mask": torch.tensor(s["labels_mask"], dtype=torch.long),
+            "index": torch.tensor(s["index"], dtype=torch.long),
+        }
+
+    def get_metadata(self, idx: int) -> dict[str, str]:
+        s = self.samples[idx]
+        return {
+            "category": "math_reasoning",
+            "instruction": s["instruction"],
+            "response": s["final_answer"],
+        }
+
+
+class EvalInstructionDataset(Dataset):
+    """Evaluation-only instruction dataset for DA-KD-style benchmarks.
+
+    Supports: DollyEval, SelfInst, Super-Natural, Unnatural, VicunaEval.
+
+    Each benchmark is loaded from its HuggingFace source or local path,
+    tokenized with prompt format, and used only for generation + ROUGE-L.
+
+    Args:
+        tokenizer: HuggingFace tokenizer.
+        eval_name: One of ``"dolly_eval"``, ``"self_inst"``, ``"super_natural"``,
+            ``"unnatural"``, ``"vicuna_eval"``.
+        max_seq_len: Maximum sequence length.
+        max_samples: Limit number of samples (None = all).
+        seed: Random seed for shuffling.
+    """
+
+    # Dataset configs: (hf_name, hf_split, instruction_key, input_key, output_key)
+    EVAL_CONFIGS: dict[str, dict[str, str]] = {
+        "dolly_eval": {
+            "hf_name": "databricks/databricks-dolly-15k",
+            "hf_split": "train",
+            "instruction_key": "instruction",
+            "input_key": "context",
+            "output_key": "response",
+            "use_dolly_eval_subset": True,
+        },
+        "self_inst": {
+            "hf_name": "yizhongw/self_instruct",
+            "hf_config": "self_instruct",
+            "hf_split": "train",
+            "instruction_key": "prompt",
+            "input_key": "",
+            "output_key": "completion",
+        },
+        "super_natural": {
+            "hf_name": "Muennighoff/super_natural_instructions",
+            "hf_config": "default",
+            "hf_split": "test",
+            "instruction_key": "definition",
+            "input_key": "inputs",
+            "output_key": "targets",
+        },
+        "unnatural": {
+            "hf_name": "mrm8488/unnatural-instructions-full",
+            "hf_split": "train",
+            "instruction_key": "instruction",
+            "input_key": "input",
+            "output_key": "output",
+        },
+        "vicuna_eval": {
+            "hf_name": "lmsys/chatbot_arena_conversations",
+            "hf_split": "train",
+            "instruction_key": "question",
+            "input_key": "",
+            "output_key": "",
+            "use_vicuna_eval": True,
+        },
+    }
+
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        eval_name: str,
+        max_seq_len: int = 512,
+        max_samples: int | None = 252,
+        seed: int = 42,
+    ) -> None:
+        self.tokenizer = tokenizer
+        self.max_seq_len = max_seq_len
+        self.eval_name = eval_name
+
+        self.samples: list[dict[str, Any]] = []
+        self._load_eval_dataset(eval_name, tokenizer, max_seq_len, max_samples, seed)
+
+    def _load_eval_dataset(
+        self, eval_name: str, tokenizer: PreTrainedTokenizer,
+        max_seq_len: int, max_samples: int | None, seed: int,
+    ) -> None:
+        """Load evaluation dataset based on name.
+
+        For datasets that are hard to load automatically, falls back to
+        generating a minimal evaluation prompt set.
+        """
+        try:
+            if eval_name == "dolly_eval":
+                self._load_dolly_eval(tokenizer, max_seq_len, max_samples, seed)
+            elif eval_name == "self_inst":
+                self._load_self_inst(tokenizer, max_seq_len, max_samples, seed)
+            elif eval_name == "super_natural":
+                self._load_super_natural(tokenizer, max_seq_len, max_samples, seed)
+            elif eval_name == "unnatural":
+                self._load_unnatural(tokenizer, max_seq_len, max_samples, seed)
+            elif eval_name == "vicuna_eval":
+                self._load_vicuna_eval(tokenizer, max_seq_len, max_samples, seed)
+            else:
+                raise ValueError(
+                    f"Unknown eval dataset: {eval_name}. "
+                    f"Must be one of {list(self.EVAL_CONFIGS.keys())}"
+                )
+        except Exception as e:
+            print(f"WARNING: Failed to load {eval_name}: {e}. Using empty dataset.")
+
+    def _tokenize_sample(
+        self, tokenizer: PreTrainedTokenizer, instruction: str,
+        context: str, response: str, max_seq_len: int, idx: int,
+    ) -> dict[str, Any]:
+        prompt_str = _format_prompt(instruction, context)
+        full_str = prompt_str + response
+
+        prompt_enc = tokenizer(
+            prompt_str, add_special_tokens=True, truncation=True,
+            max_length=max_seq_len,
+        )
+        full_enc = tokenizer(
+            full_str, add_special_tokens=True, truncation=True,
+            max_length=max_seq_len, padding=False,
+        )
+
+        input_ids = full_enc["input_ids"]
+        attention_mask = full_enc["attention_mask"]
+        prompt_len = len(prompt_enc["input_ids"])
+        seq_len = len(input_ids)
+        labels_mask = [0] * min(prompt_len, seq_len) + [1] * max(0, seq_len - prompt_len)
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels_mask": labels_mask,
+            "index": idx,
+            "instruction": instruction,
+            "response": response,
+        }
+
+    def _load_dolly_eval(self, tokenizer, max_seq_len, max_samples, seed):
+        """Dolly eval: last 500 of the Dolly-15K dataset (test split)."""
+        raw = load_dataset("databricks/databricks-dolly-15k", split="train")
+        raw = raw.shuffle(seed=seed)
+        n_total = len(raw)
+        raw = raw.select(range(n_total - 500, n_total))  # last 500 = test
+        if max_samples:
+            raw = raw.select(range(min(max_samples, len(raw))))
+        for i, row in enumerate(raw):
+            self.samples.append(self._tokenize_sample(
+                tokenizer, row["instruction"], row.get("context", ""),
+                row["response"], max_seq_len, i,
+            ))
+
+    def _load_self_inst(self, tokenizer, max_seq_len, max_samples, seed):
+        """Self-Instruct evaluation set (252 samples)."""
+        raw = load_dataset("yizhongw/self_instruct", "self_instruct", split="train")
+        raw = raw.shuffle(seed=seed)
+        if max_samples:
+            raw = raw.select(range(min(max_samples, len(raw))))
+        for i, row in enumerate(raw):
+            self.samples.append(self._tokenize_sample(
+                tokenizer, row["prompt"], "",
+                row["completion"], max_seq_len, i,
+            ))
+
+    def _load_super_natural(self, tokenizer, max_seq_len, max_samples, seed):
+        """Super-Natural Instructions test set."""
+        raw = load_dataset(
+            "Muennighoff/super_natural_instructions", "default", split="test",
+            streaming=True,
+        )
+        limit = max_samples or 500
+        samples = []
+        for row in raw:
+            if len(samples) >= limit:
+                break
+            instruction = row.get("definition", "")
+            inp = row.get("inputs", "")
+            targets = row.get("targets", [""])[0] if isinstance(row.get("targets"), list) else row.get("targets", "")
+            samples.append((instruction, inp, targets))
+        for i, (inst, inp, resp) in enumerate(samples):
+            self.samples.append(self._tokenize_sample(
+                tokenizer, inst, inp, resp, max_seq_len, i,
+            ))
+
+    def _load_unnatural(self, tokenizer, max_seq_len, max_samples, seed):
+        """Unnatural Instructions."""
+        raw = load_dataset("mrm8488/unnatural-instructions-full", split="train")
+        raw = raw.shuffle(seed=seed)
+        if max_samples:
+            raw = raw.select(range(min(max_samples, len(raw))))
+        for i, row in enumerate(raw):
+            inst = row.get("instruction", "")
+            inp = row.get("input", "")
+            out = row.get("output", "")
+            self.samples.append(self._tokenize_sample(
+                tokenizer, inst, inp, out, max_seq_len, i,
+            ))
+
+    def _load_vicuna_eval(self, tokenizer, max_seq_len, max_samples, seed):
+        """Vicuna evaluation set (80 questions)."""
+        # Vicuna eval is a small set of 80 questions; use a known source
+        try:
+            raw = load_dataset("lmsys/vicuna_eval", split="train")
+        except Exception:
+            # Fallback: load from alternative source
+            try:
+                raw = load_dataset("HuggingFaceH4/vicuna_eval", split="train")
+            except Exception:
+                print("WARNING: Could not load Vicuna eval. Skipping.")
+                return
+        raw = raw.shuffle(seed=seed)
+        if max_samples:
+            raw = raw.select(range(min(max_samples, len(raw))))
+        for i, row in enumerate(raw):
+            question = row.get("text", row.get("question", ""))
+            self.samples.append(self._tokenize_sample(
+                tokenizer, question, "", "", max_seq_len, i,
+            ))
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        s = self.samples[idx]
+        return {
+            "input_ids": torch.tensor(s["input_ids"], dtype=torch.long),
+            "attention_mask": torch.tensor(s["attention_mask"], dtype=torch.long),
+            "labels_mask": torch.tensor(s["labels_mask"], dtype=torch.long),
+            "index": torch.tensor(s["index"], dtype=torch.long),
+        }
+
+    def get_metadata(self, idx: int) -> dict[str, str]:
+        s = self.samples[idx]
+        return {
+            "category": self.eval_name,
+            "instruction": s["instruction"],
+            "response": s["response"],
+        }
 
 
 def collate_fn(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:

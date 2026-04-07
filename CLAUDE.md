@@ -12,28 +12,31 @@ Read it completely before making any changes.
 **Paper title**: *Saliency-Guided Knowledge Distillation: A Sobolev Perspective on Teaching Students Where to Look*
 
 ### Model pairs
-- Primary: Qwen3-8B (teacher) → Qwen3-0.6B (student)
+- Primary: Qwen3-8B (teacher) → Qwen3-1.7B (student) and Qwen3-0.6B (student)
 - Secondary (cross-architecture): LLaMA 3.1-8B → LLaMA 3.1-1B
 
-### Datasets & evaluation
+### Datasets & evaluation (aligned with DA-KD, ICML 2025)
 
-**Primary: SQuAD 2.0** (`rajpurkar/squad_v2`) — extractive QA, context-dependent
-- Every sample has a context paragraph + question; answer must be extracted from context
-- Answerable subset only (unanswerable questions filtered out, ~86K train, ~5.9K val)
-- Train: HF `train` split, shuffled(seed=42)
-- Val/Test: HF `validation` split, shuffled, split in half (first half=val, second half=test)
-- Primary metrics: Exact Match (EM), Token F1 on test split
-- Saliency metric: Evidence Concentration (fraction of saliency mass on answer span)
-- Secondary metric: Mean JSD (Saliency Loyalty) on val split
-- Answer span token positions tracked for evidence concentration evaluation
+**Task-Agnostic Instruction Following** (Table 1):
+- Training: Dolly-15K (`databricks/databricks-dolly-15k`)
+- Evaluation: DollyEval, SelfInst, Super-Natural, Unnatural, VicunaEval
+- Metric: ROUGE-L on each eval set + average
+- 5 random seeds for statistical significance
 
-**Secondary: Dolly-15K** (`databricks/databricks-dolly-15k`) — instruction-following, generalization
+**Task-Specific** (Table 2):
+- **SAMSum** (`samsum`) — dialogue summarization, ROUGE-L
+- **GSM8K** (`openai/gsm8k`) — mathematical reasoning, zero-shot accuracy
+- **SQuAD 2.0** (`rajpurkar/squad_v2`) — extractive QA
+  - Answerable subset only (~86K train, ~5.9K val)
+  - Metrics: EM, Token F1, PPL
+  - Saliency metric: Evidence Concentration (fraction of saliency mass on answer span)
+  - Answer span token positions tracked for evidence concentration evaluation
+
+**Dolly-15K** data splits:
 - shuffle(seed=42), max_seq_len=512
 - Train subset: first N-1000 samples (~14K)
 - Val subset: next 500 samples
 - Test subset: last 500 samples
-- Primary metric: ROUGE-L on test-500
-- Used to demonstrate SaGD generalizes beyond extractive QA
 
 **Benchmark defense**: MMLU, ARC-Challenge, TruthfulQA (lm-eval-harness, appendix only)
 
@@ -271,8 +274,13 @@ excluded from EC computation.
 
 ```python
 METHODS = {
-    "standard_kd",    # Forward KL baseline
-    "reverse_kl",     # Reverse KL baseline
+    "sft",            # Supervised fine-tuning (no teacher)
+    "standard_kd",    # Forward KL (Hinton, 2015)
+    "reverse_kl",     # Reverse KL / MiniLLM (Gu et al., 2024)
+    "seqkd",          # Sequence-level KD (Kim & Rush, 2016) — SFT on teacher outputs
+    "gkd",            # Generalized KD with JSD (Agarwal et al., 2023)
+    "distillm",       # DistiLLM with Skew KL (Ko et al., 2024)
+    "dakd",           # DA-KD with BDL (He et al., ICML 2025)
     "sagd",           # SaGD (our method)
 }
 ```

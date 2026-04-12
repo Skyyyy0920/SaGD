@@ -1,11 +1,12 @@
 #!/bin/bash
 # =============================================================================
 # Phase 1 evaluation on GPU 1 — Qwen3-0.6B
-# Evaluates all 40 trained models on 5 instruction-following benchmarks
-# (DollyEval, SelfInst, Super-Natural, Unnatural, VicunaEval)
+# Evaluates all 40 trained models on 4 instruction-following benchmarks
+# (DollyEval, SelfInst, Super-Natural, Unnatural)
+#
+# Runs 2 eval processes in parallel on the same GPU for 2× throughput.
 # =============================================================================
 
-set -e
 cd "$(dirname "$0")/.."
 
 export CUDA_VISIBLE_DEVICES=1
@@ -22,35 +23,78 @@ mkdir -p "$LOG_DIR"
 SEEDS=(42 123 456 789 2024)
 METHODS=(sft standard_kd reverse_kl seqkd gkd distillm dakd sagd)
 
-echo "===== Phase 1 Eval (GPU1): Qwen3-0.6B × 5 benchmarks ====="
+echo "===== Phase 1 Eval (GPU1): Qwen3-0.6B × 4 benchmarks (2 parallel) ====="
 
+# Build a flat list of (METHOD, SEED) jobs
+JOBS=()
 for SEED in "${SEEDS[@]}"; do
     for METHOD in "${METHODS[@]}"; do
         CKPT="${OUTPUT_DIR}/${METHOD}/seed_${SEED}/student_final.pt"
         OUT_FILE="${OUTPUT_DIR}/${METHOD}/seed_${SEED}/benchmark_rouge.json"
-        LOG_FILE="${LOG_DIR}/eval_${METHOD}_seed${SEED}.log"
 
-        # Skip if already evaluated
         if [ -f "$OUT_FILE" ]; then
-            echo "[GPU1] SKIP eval ${METHOD}/seed_${SEED} (benchmark_rouge.json exists)"
+            echo "[GPU1] SKIP ${METHOD}/seed_${SEED} (already evaluated)"
             continue
         fi
-
-        # Skip if checkpoint missing
         if [ ! -f "$CKPT" ]; then
-            echo "[GPU1] SKIP eval ${METHOD}/seed_${SEED} (no checkpoint)"
+            echo "[GPU1] SKIP ${METHOD}/seed_${SEED} (no checkpoint)"
             continue
         fi
+        JOBS+=("${METHOD}|${SEED}")
+    done
+done
 
-        echo "[GPU1] >>> eval ${METHOD}/seed_${SEED}"
+N_JOBS=${#JOBS[@]}
+echo "[GPU1] ${N_JOBS} jobs to run (2 at a time)"
+
+# Run jobs two at a time
+i=0
+while [ $i -lt $N_JOBS ]; do
+    # Job A
+    IFS='|' read -r METHOD_A SEED_A <<< "${JOBS[$i]}"
+    CKPT_A="${OUTPUT_DIR}/${METHOD_A}/seed_${SEED_A}/student_final.pt"
+    OUT_A="${OUTPUT_DIR}/${METHOD_A}/seed_${SEED_A}/benchmark_rouge.json"
+    LOG_A="${LOG_DIR}/eval_${METHOD_A}_seed${SEED_A}.log"
+
+    echo "[GPU1] >>> [A] ${METHOD_A}/seed_${SEED_A}"
+    python scripts/evaluate_benchmarks.py \
+        --student_model "$STUDENT" \
+        --student_ckpt "$CKPT_A" \
+        --output_path "$OUT_A" \
+        --device "$DEVICE" \
+        --seed "$SEED_A" \
+        > "$LOG_A" 2>&1 &
+    PID_A=$!
+
+    # Job B (if exists)
+    j=$((i + 1))
+    PID_B=""
+    if [ $j -lt $N_JOBS ]; then
+        IFS='|' read -r METHOD_B SEED_B <<< "${JOBS[$j]}"
+        CKPT_B="${OUTPUT_DIR}/${METHOD_B}/seed_${SEED_B}/student_final.pt"
+        OUT_B="${OUTPUT_DIR}/${METHOD_B}/seed_${SEED_B}/benchmark_rouge.json"
+        LOG_B="${LOG_DIR}/eval_${METHOD_B}_seed${SEED_B}.log"
+
+        echo "[GPU1] >>> [B] ${METHOD_B}/seed_${SEED_B}"
         python scripts/evaluate_benchmarks.py \
             --student_model "$STUDENT" \
-            --student_ckpt "$CKPT" \
-            --output_path "$OUT_FILE" \
+            --student_ckpt "$CKPT_B" \
+            --output_path "$OUT_B" \
             --device "$DEVICE" \
-            --seed "$SEED" \
-            2>&1 | tee "$LOG_FILE"
-    done
+            --seed "$SEED_B" \
+            > "$LOG_B" 2>&1 &
+        PID_B=$!
+    fi
+
+    # Wait for both to finish before launching next pair
+    wait $PID_A
+    echo "[GPU1]     done [A] ${METHOD_A}/seed_${SEED_A}"
+    if [ -n "$PID_B" ]; then
+        wait $PID_B
+        echo "[GPU1]     done [B] ${METHOD_B}/seed_${SEED_B}"
+    fi
+
+    i=$((i + 2))
 done
 
 # =============================================================================

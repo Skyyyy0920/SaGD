@@ -25,7 +25,8 @@ from sagd.data import EvalInstructionDataset
 from sagd.evaluation import compute_rouge, generate_responses
 from sagd.models import load_student
 
-BENCHMARKS = ["dolly_eval", "self_inst", "super_natural", "unnatural", "vicuna_eval"]
+# VicunaEval removed: no reliable HF source; it requires GPT-4 judging, not ROUGE-L.
+BENCHMARKS = ["dolly_eval", "self_inst", "super_natural", "unnatural"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,8 +34,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--student_model", type=str, default="Qwen/Qwen3-0.6B")
     p.add_argument("--student_ckpt", type=str, required=True)
     p.add_argument("--max_seq_len", type=int, default=512)
-    p.add_argument("--max_samples", type=int, default=None,
-                    help="Max samples per benchmark (None = all)")
+    p.add_argument("--max_samples", type=int, default=500,
+                    help="Max samples per benchmark (default 500)")
     p.add_argument("--max_new_tokens", type=int, default=256)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--device", type=str, default="cuda:0")

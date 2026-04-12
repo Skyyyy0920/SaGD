@@ -661,8 +661,8 @@ class EvalInstructionDataset(Dataset):
         raw = raw.shuffle(seed=seed)
         n_total = len(raw)
         raw = raw.select(range(n_total - 500, n_total))  # last 500 = test
-        if max_samples:
-            raw = raw.select(range(min(max_samples, len(raw))))
+        limit = max_samples if max_samples is not None else 500
+        raw = raw.select(range(min(limit, len(raw))))
         for i, row in enumerate(raw):
             self.samples.append(self._tokenize_sample(
                 tokenizer, row["instruction"], row.get("context", ""),
@@ -678,8 +678,8 @@ class EvalInstructionDataset(Dataset):
         """
         raw = load_dataset("yizhongw/self_instruct", "human_eval", split="train")
         raw = raw.shuffle(seed=seed)
-        if max_samples:
-            raw = raw.select(range(min(max_samples, len(raw))))
+        limit = max_samples if max_samples is not None else 252
+        raw = raw.select(range(min(limit, len(raw))))
         for i, row in enumerate(raw):
             instruction = row.get("instruction", "")
             instances = row.get("instances", [])
@@ -693,19 +693,22 @@ class EvalInstructionDataset(Dataset):
             ))
 
     def _load_super_natural(self, tokenizer, max_seq_len, max_samples, seed):
-        """Super-Natural Instructions test set."""
+        """Super-Natural Instructions test set (streaming, capped at 500)."""
         raw = load_dataset(
             "Muennighoff/super_natural_instructions", "default", split="test",
             streaming=True,
         )
-        limit = max_samples or 500
+        limit = max_samples if max_samples is not None else 500
         samples = []
         for row in raw:
             if len(samples) >= limit:
                 break
             instruction = row.get("definition", "")
             inp = row.get("inputs", "")
-            targets = row.get("targets", [""])[0] if isinstance(row.get("targets"), list) else row.get("targets", "")
+            targets = row.get("targets", "")
+            # targets can be a list of strings
+            if isinstance(targets, list):
+                targets = targets[0] if targets else ""
             samples.append((instruction, inp, targets))
         for i, (inst, inp, resp) in enumerate(samples):
             self.samples.append(self._tokenize_sample(
@@ -713,38 +716,17 @@ class EvalInstructionDataset(Dataset):
             ))
 
     def _load_unnatural(self, tokenizer, max_seq_len, max_samples, seed):
-        """Unnatural Instructions."""
+        """Unnatural Instructions (capped at 500 for eval)."""
         raw = load_dataset("mrm8488/unnatural-instructions-full", split="train")
         raw = raw.shuffle(seed=seed)
-        if max_samples:
-            raw = raw.select(range(min(max_samples, len(raw))))
+        limit = max_samples if max_samples is not None else 500
+        raw = raw.select(range(min(limit, len(raw))))
         for i, row in enumerate(raw):
             inst = row.get("instruction", "")
             inp = row.get("input", "")
             out = row.get("output", "")
             self.samples.append(self._tokenize_sample(
                 tokenizer, inst, inp, out, max_seq_len, i,
-            ))
-
-    def _load_vicuna_eval(self, tokenizer, max_seq_len, max_samples, seed):
-        """Vicuna evaluation set (80 questions)."""
-        # Vicuna eval is a small set of 80 questions; use a known source
-        try:
-            raw = load_dataset("lmsys/vicuna_eval", split="train")
-        except Exception:
-            # Fallback: load from alternative source
-            try:
-                raw = load_dataset("HuggingFaceH4/vicuna_eval", split="train")
-            except Exception:
-                print("WARNING: Could not load Vicuna eval. Skipping.")
-                return
-        raw = raw.shuffle(seed=seed)
-        if max_samples:
-            raw = raw.select(range(min(max_samples, len(raw))))
-        for i, row in enumerate(raw):
-            question = row.get("text", row.get("question", ""))
-            self.samples.append(self._tokenize_sample(
-                tokenizer, question, "", "", max_seq_len, i,
             ))
 
     def __len__(self) -> int:

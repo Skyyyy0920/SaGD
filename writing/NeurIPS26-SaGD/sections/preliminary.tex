@@ -1,0 +1,25 @@
+% ============================================================================
+%  2. PRELIMINARIES
+% ============================================================================
+
+\section{Preliminaries}
+
+\paragraph{Knowledge distillation.}
+Let $f_T$ and $f_S$ denote the teacher and student models, each mapping an input token sequence $x = (e_1, \ldots, e_L) \in \mathbb{R}^{L \times d}$ to a distribution over the vocabulary $\mathcal{V}$ at each position.
+Standard knowledge distillation~\citep{hinton2015distilling} trains the student by minimizing the per-position forward KL divergence on a training set $\{x_i\}_{i=1}^n$:
+\begin{equation}\label{eq:standard-kd}
+\mathcal{L}_\mathrm{KD} = \frac{1}{n} \sum_{i=1}^{n} \sum_{t \in \mathcal{R}_i} D_\mathrm{KL}\!\left( p_T(\cdot \mid x_i, t) \;\big\|\; p_S(\cdot \mid x_i, t) \right),
+\end{equation}
+where $\mathcal{R}_i$ denotes the response token positions for sample $i$, and $p_T(\cdot \mid x, t)$, $p_S(\cdot \mid x, t)$ are the teacher's and student's next-token distributions at position $t$ with temperature scaling.
+
+\paragraph{Input saliency.}
+Given a sample $x$ with prompt tokens at positions $\{1, \ldots, L_p\}$ and response tokens at positions $\{L_p\!+\!1, \ldots, L\}$, the \emph{input saliency} at prompt position $j$ measures how much the response generation depends on the $j$-th input token:
+\begin{equation}\label{eq:saliency-def}
+s_j(x) = \left\| \frac{\partial \log P(\text{response} \mid x)}{\partial e_j} \right\|_2,
+\end{equation}
+where $e_j \in \mathbb{R}^d$ is the embedding of the $j$-th token and $\log P(\text{response} \mid x) = \sum_{t \in \mathcal{R}} \log p(x_t \mid x_{<t})$ is the response log-likelihood.
+The saliency vector $\mathbf{s}(x) = (s_1, \ldots, s_{L_p}, 0, \ldots, 0) \in \mathbb{R}^L$ summarizes the model's input dependence pattern: positions with high saliency are those the model relies on to generate the response.
+
+\paragraph{Notation.}
+We write $J_T(x), J_S(x) \in \mathbb{R}^{V \times (L \cdot d)}$ for the Jacobians of teacher and student outputs with respect to the flattened input embeddings, and $\mathbf{s}_T(x), \mathbf{s}_S(x) \in \mathbb{R}^L$ for their respective saliency vectors. We use $\hat{\mathbf{s}}$ to denote the softmax-normalized saliency distribution, $\hat{s}_j = \exp(s_j / \tau_s) / \sum_k \exp(s_k / \tau_s)$, restricted to prompt positions.
+

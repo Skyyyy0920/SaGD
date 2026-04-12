@@ -1,0 +1,246 @@
+% =============================================================================
+%  REFERENCES — SaGD (NeurIPS 2026)
+%  All entries verified for existence. Use \cite{TODO} for unverified refs.
+% =============================================================================
+
+% --- Knowledge Distillation: Foundations ---
+
+@article{hinton2015distilling,
+  title={Distilling the Knowledge in a Neural Network},
+  author={Hinton, Geoffrey and Vinyals, Oriol and Dean, Jeff},
+  journal={arXiv preprint arXiv:1503.02531},
+  year={2015}
+}
+
+@inproceedings{kim2016sequence,
+  title={Sequence-Level Knowledge Distillation},
+  author={Kim, Yoon and Rush, Alexander M},
+  booktitle={Proceedings of the Conference on Empirical Methods in Natural Language Processing (EMNLP)},
+  pages={1317--1327},
+  year={2016}
+}
+
+% --- KD for LLMs ---
+
+@inproceedings{gu2024minillm,
+  title={MiniLLM: Knowledge Distillation of Large Language Models},
+  author={Gu, Yuxian and Dong, Li and Wei, Furu and Huang, Minlie},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2024}
+}
+
+@inproceedings{agarwal2024gkd,
+  title={On-Policy Distillation of Language Models: Learning from Self-Generated Mistakes},
+  author={Agarwal, Rishabh and Vieillard, Nino and Stanczyk, Piotr and Ramos, Sabela and Geist, Matthieu and Bachem, Olivier},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2024}
+}
+
+@inproceedings{ko2024distillm,
+  title={DistiLLM: Towards Streamlined Distillation for Large Language Models},
+  author={Ko, Jongwoo and Kim, Sungnyun and Chen, Tianyi and Yun, Se-Young},
+  booktitle={International Conference on Machine Learning (ICML)},
+  year={2024}
+}
+
+@inproceedings{fu2023specializing,
+  title={Specializing Smaller Language Models towards Multi-Step Reasoning},
+  author={Fu, Yao and Peng, Hao and Ou, Litu and Sabharwal, Ashish and Khot, Tushar},
+  booktitle={International Conference on Machine Learning (ICML)},
+  year={2023}
+}
+
+% --- Adaptive / Difficulty-aware KD ---
+
+@inproceedings{wu2025akl,
+  title={Rethinking Kullback-Leibler Divergence in Knowledge Distillation for Large Language Models},
+  author={Wu, Taiqiang and Tao, Chaofan and Wang, Jiahao and Yang, Runming and Zhao, Zhe and Wong, Ngai},
+  booktitle={International Conference on Computational Linguistics (COLING)},
+  year={2025}
+}
+
+@inproceedings{dakd2025,
+  title={DA-KD: Difficulty-Aware Knowledge Distillation for Large Language Models},
+  author={He, Yuxin and others},
+  booktitle={International Conference on Machine Learning (ICML)},
+  year={2025},
+  note={To appear}
+}
+
+% --- Attribution / Saliency in KD ---
+
+@inproceedings{wu-etal-2023-ad,
+  title={{AD}-{KD}: Attribution-Driven Knowledge Distillation for Language Model Compression},
+  author={Wu, Siyue and Chen, Hongzhan and Quan, Xiaojun and Wang, Qifan and Wang, Rui},
+  booktitle={Proceedings of the 61st Annual Meeting of the Association for Computational Linguistics (ACL)},
+  pages={8449--8465},
+  year={2023}
+}
+
+@inproceedings{wang2022gkd,
+  title={Gradient Knowledge Distillation for Pre-trained Language Models},
+  author={Wang, Lean and Yao, Lei and Huang, Ye and Wu, Hanming and Zhang, Jianhua},
+  booktitle={Proceedings of the Conference on Empirical Methods in Natural Language Processing (EMNLP)},
+  year={2022}
+}
+
+@article{dehigahawattage2026learning,
+  title={Learning to Reason: Temporal Saliency Distillation for Interpretable Knowledge Transfer},
+  author={Dehigahawattage, Nilushika Udayangani Hewa and Nandakishor, Kishor and Palaniswami, Marimuthu},
+  journal={arXiv preprint arXiv:2601.04263},
+  year={2026}
+}
+
+@article{ballout2024efficient,
+  title={Efficient Knowledge Distillation: Empowering Small Language Models with Teacher Model Insights},
+  author={Ballout, Mohamad and others},
+  journal={arXiv preprint arXiv:2409.12586},
+  year={2024}
+}
+
+% --- Jacobian / Sobolev Theory ---
+
+@inproceedings{czarnecki2017sobolev,
+  title={Sobolev Training for Neural Networks},
+  author={Czarnecki, Wojciech Marian and Osindero, Simon and Jaderberg, Max and Swirszcz, Grzegorz and Pascanu, Razvan},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2017}
+}
+
+@inproceedings{srinivas2018knowledge,
+  title={Knowledge Transfer with Jacobian Matching},
+  author={Srinivas, Suraj and Fleuret, Fran{\c{c}}ois},
+  booktitle={International Conference on Machine Learning (ICML)},
+  year={2018}
+}
+
+% --- Distributionally Robust Optimization ---
+
+@inproceedings{duchi2021learning,
+  title={Learning Models with Uniform Performance via Distributionally Robust Optimization},
+  author={Duchi, John C and Namkoong, Hongseok},
+  booktitle={Annals of Statistics},
+  volume={49},
+  number={3},
+  pages={1378--1406},
+  year={2021}
+}
+
+@inproceedings{sagawa2020distributionally,
+  title={Distributionally Robust Neural Networks for Group Shifts: On the Importance of Regularization for Worst-Case Generalization},
+  author={Sagawa, Shiori and Koh, Pang Wei and Hashimoto, Tatsunori B and Liang, Percy},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2020}
+}
+
+% --- Evaluation ---
+
+@article{lin2004rouge,
+  title={ROUGE: A Package for Automatic Evaluation of Summaries},
+  author={Lin, Chin-Yew},
+  journal={Text Summarization Branches Out},
+  year={2004}
+}
+
+@inproceedings{zhang2020bertscore,
+  title={BERTScore: Evaluating Text Generation with BERT},
+  author={Zhang, Tianyi and Kishore, Varsha and Wu, Felix and Weinberger, Kilian Q and Artzi, Yoav},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2020}
+}
+
+@article{zheng2023judging,
+  title={Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena},
+  author={Zheng, Lianmin and Chiang, Wei-Lin and Sheng, Ying and Zhuang, Siyuan and Wu, Zhanghao and Zhuang, Yonghao and Lin, Zi and Li, Zhuohan and Li, Dacheng and Xing, Eric P and others},
+  journal={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2023}
+}
+
+% --- Datasets ---
+
+@inproceedings{rajpurkar2018know,
+  title={Know What You Don't Know: Unanswerable Questions for {SQuAD}},
+  author={Rajpurkar, Pranav and Jia, Robin and Liang, Percy},
+  booktitle={Proceedings of the 56th Annual Meeting of the Association for Computational Linguistics (ACL)},
+  pages={784--789},
+  year={2018}
+}
+
+@article{dolly,
+  title={Free Dolly: Introducing the World's First Truly Open Instruction-Tuned LLM},
+  author={{Databricks}},
+  journal={Databricks Blog},
+  year={2023}
+}
+
+@inproceedings{gliwa2019samsum,
+  title={{SAMS}um Corpus: A Human-annotated Dialogue Dataset for Abstractive Summarization},
+  author={Gliwa, Bogdan and Mochol, Iwona and Biesek, Maciej and Wawer, Aleksander},
+  booktitle={Proceedings of the 2nd Workshop on New Frontiers in Summarization},
+  pages={70--79},
+  year={2019}
+}
+
+@article{cobbe2021gsm8k,
+  title={Training Verifiers to Solve Math Word Problems},
+  author={Cobbe, Karl and Kosaraju, Vineet and Bavarian, Mohammad and Chen, Mark and Jun, Heewoo and Kaiser, Lukasz and Plappert, Matthias and Tworek, Jerry and Hilton, Jacob and Nakano, Reiichiro and Hesse, Christopher and Schulman, John},
+  journal={arXiv preprint arXiv:2110.14168},
+  year={2021}
+}
+
+% --- Models ---
+
+@article{qwen3,
+  title={Qwen3 Technical Report},
+  author={{Qwen Team}},
+  journal={arXiv preprint},
+  year={2025}
+}
+
+@article{grattafiori2024llama3,
+  title={The {Ll}ama 3 Herd of Models},
+  author={Grattafiori, Aaron and Dubey, Abhimanyu and others},
+  journal={arXiv preprint arXiv:2407.21783},
+  year={2024}
+}
+
+% --- Saliency / Attribution ---
+
+@inproceedings{simonyan2014deep,
+  title={Deep Inside Convolutional Networks: Visualising Image Classification Models and Saliency Maps},
+  author={Simonyan, Karen and Vedaldi, Andrea and Zisserman, Andrew},
+  booktitle={Workshop at International Conference on Learning Representations (ICLR)},
+  year={2014}
+}
+
+@inproceedings{sundararajan2017axiomatic,
+  title={Axiomatic Attribution for Deep Networks},
+  author={Sundararajan, Mukund and Taly, Ankur and Yan, Qiqi},
+  booktitle={International Conference on Machine Learning (ICML)},
+  pages={3319--3328},
+  year={2017}
+}
+
+% --- Benchmark evaluation ---
+
+@article{hendrycks2021measuring,
+  title={Measuring Massive Multitask Language Understanding},
+  author={Hendrycks, Dan and Burns, Collin and Basart, Steven and Zou, Andy and Mazeika, Mantas and Song, Dawn and Steinhardt, Jacob},
+  journal={International Conference on Learning Representations (ICLR)},
+  year={2021}
+}
+
+@inproceedings{clark2018think,
+  title={Think you have Solved Question Answering? Try {ARC}, the {AI2} Reasoning Challenge},
+  author={Clark, Peter and Cowhey, Isaac and Etzioni, Oren and Khot, Tushar and Sabharwal, Ashish and Schoenick, Carissa and Tafjord, Oyvind},
+  journal={arXiv preprint arXiv:1803.05457},
+  year={2018}
+}
+
+@inproceedings{lin2022truthfulqa,
+  title={TruthfulQA: Measuring How Models Mimic Human Falsehoods},
+  author={Lin, Stephanie and Hilton, Jacob and Evans, Owain},
+  booktitle={Proceedings of the 60th Annual Meeting of the Association for Computational Linguistics (ACL)},
+  pages={3214--3252},
+  year={2022}
+}

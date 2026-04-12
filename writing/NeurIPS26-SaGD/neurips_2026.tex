@@ -1,0 +1,90 @@
+\documentclass{article}
+
+% NeurIPS 2026 submission (double-blind)
+\usepackage{neurips_2026}
+
+% --- Standard packages ---
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+
+% --- Math and algorithms ---
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{mathtools}
+
+% --- Figures and tables ---
+\usepackage{graphicx}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{multirow}
+\usepackage{tabularx}
+
+% --- Theorem environments ---
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{remark}{Remark}
+\newtheorem{definition}{Definition}
+
+% --- Custom commands ---
+\newcommand{\sagd}{\textsc{SaGD}}
+\newcommand{\kl}{\mathrm{KL}}
+\newcommand{\jsd}{\mathrm{JSD}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\cR}{\mathcal{R}}
+\newcommand{\cL}{\mathcal{L}}
+\newcommand{\cF}{\mathcal{F}}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator{\tr}{tr}
+\DeclareMathOperator{\diag}{diag}
+
+\title{Saliency-Guided Knowledge Distillation:\\Implicit Jacobian Matching for LLMs via Noise Perturbation}
+
+\author{%
+  Anonymous Author(s)
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Knowledge distillation (KD) for large language models aligns teacher and student output distributions but places no constraint on \emph{which input tokens} each model relies upon---its input--output Jacobian.
+We show this gap is structural, not incidental: a first-order Taylor expansion of the KL divergence at a perturbed input decomposes into the standard (zero-order) distillation loss plus a term proportional to the Frobenius norm of the Jacobian difference.
+Standard KD minimizes only the former, permitting students that match outputs yet exhibit arbitrarily different input sensitivities---an $L^2$ approximation where a Sobolev $W^{1,2}$ guarantee is needed.
+Computing the full Jacobian ($V \times L \times d$ elements) is intractable for billion-parameter models.
+We observe, extending a result of Srinivas and Fleuret, that evaluating KL on Gaussian-perturbed embeddings \emph{implicitly} recovers the Jacobian Frobenius norm, without explicit computation or second-order gradients.
+Building on this, we propose \textbf{Saliency-Guided Knowledge Distillation (\sagd{})}, which combines two complementary mechanisms: (1)~\emph{noise-injected KL}, where position-adaptive Gaussian perturbations to embeddings provably match the full Jacobian, and (2)~\emph{saliency-guided sample reweighting}, which allocates more training budget to examples where teacher and student attend to different input tokens---a form of distributionally robust optimization.
+On SQuAD~2.0 extractive QA and Dolly-15K instruction following (Qwen3-8B $\to$ 0.6B/1.7B), \sagd{} improves over standard KD and six recent baselines in both task metrics (Exact Match, Token F1, ROUGE-L) and a new diagnostic: \emph{evidence concentration}---the fraction of input saliency on answer-span tokens---which \sagd{} brings significantly closer to the teacher's, confirming that the student preserves the teacher's reasoning pattern, not merely its outputs.
+\end{abstract}
+
+\input{sections/introduction}
+\input{sections/background}
+\input{sections/method}
+\input{sections/experiments}
+\input{sections/conclusion}
+
+\bibliography{references}
+\bibliographystyle{abbrvnat}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\appendix
+\input{sections/appendix}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\input{checklist.tex}
+
+\end{document}

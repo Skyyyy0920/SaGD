@@ -1,0 +1,199 @@
+% ============================================================================
+%  3. METHOD
+% ============================================================================
+
+\section{Method: Saliency-Guided Knowledge Distillation}
+
+We begin by analyzing why standard KD fails to preserve input reasoning patterns (\S\ref{sec:theory}), then derive SaGD as a principled remedy (\S\ref{sec:sagd-loss}--\S\ref{sec:sagd-reweight}), and finally situate our approach within prior work (\S\ref{sec:unification}).
+
+\subsection{Why Output Matching is Not Enough}\label{sec:theory}
+
+Standard KD minimizes the distillation error at each training point $x_i$. We now ask: what happens at a nearby point $x_i + \boldsymbol{\delta}$ that the student has not seen during training?
+
+\begin{theorem}[Neighborhood error decomposition]\label{thm:taylor}
+For teacher $f_T$ and student $f_S$ with Lipschitz-continuous Jacobians, and a perturbation $\boldsymbol{\delta}$ with $\|\boldsymbol{\delta}\| \leq \epsilon$:
+\begin{equation}\label{eq:taylor}
+D_\mathrm{KL}\!\left(f_T(x + \boldsymbol{\delta}) \,\big\|\, f_S(x + \boldsymbol{\delta})\right)
+\leq D_\mathrm{KL}(f_T(x) \| f_S(x)) + \epsilon \, \|J_T(x) - J_S(x)\|_F + O(\epsilon^2).
+\end{equation}
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Apply a first-order Taylor expansion to $f_T(x + \boldsymbol{\delta})$ and $f_S(x + \boldsymbol{\delta})$ around $x$, substitute into the KL divergence, and bound the cross-term using Cauchy--Schwarz and the sub-multiplicativity of the Frobenius norm. The full proof is given in Appendix~\ref{app:proofs}.
+\end{proof}
+
+The first term is what standard KD minimizes. The second term---the Jacobian gap---is entirely unconstrained. This has a concrete implication:
+
+\begin{corollary}[Standard KD has no neighborhood guarantee]\label{cor:no-guarantee}
+There exist student functions $f_S$ satisfying $D_\mathrm{KL}(f_T(x_i) \| f_S(x_i)) = 0$ for all training points $\{x_i\}_{i=1}^n$, yet $\|J_T(x_i) - J_S(x_i)\|_F$ is arbitrarily large.
+\end{corollary}
+
+This follows from the overparameterization of neural networks: infinitely many functions interpolate the same set of training-point outputs, with arbitrarily different Jacobians~\citep{srinivas2018knowledge}.
+
+Why is the Jacobian gap the right quantity to control? The connection to reasoning alignment is direct: the Jacobian $J(x) = \partial f / \partial x$ encodes how the output changes when each input position is perturbed. Two models with matching Jacobians respond identically to input modifications---they are sensitive to the same tokens for the same reasons. Constraining the Jacobian gap thus constrains the gap in input reasoning.
+
+\begin{remark}[First-order sufficiency]\label{rem:higher-order}
+Higher-order terms in the Taylor expansion contribute $O(\epsilon^k)$ for the $k$-th order. For perturbations within a reasonable radius ($\epsilon < 1$), $\epsilon \gg \epsilon^2 \gg \epsilon^3 \gg \cdots$, so first-order matching provides the most significant improvement over zero-order. This theoretical observation motivates restricting our attention to first-order corrections, rather than pursuing computationally prohibitive higher-order matching.
+\end{remark}
+
+\begin{remark}[Connection to Sobolev spaces]\label{rem:sobolev}
+The upgrade from zero-order to first-order matching corresponds precisely to moving from $L^2$ to Sobolev $W^{1,2}$ function approximation. Standard KD minimizes $\sum_i \|f_T(x_i) - f_S(x_i)\|^2$, controlling only function values. Adding a Jacobian matching term yields $\sum_i \|f_T(x_i) - f_S(x_i)\|^2 + \|J_T(x_i) - J_S(x_i)\|_F^2$---the discrete Sobolev $W^{1,2}$ norm. Classical approximation theory guarantees that $W^{1,2}$ convergence implies convergence not just at sample points but in their neighborhoods, via Sobolev embedding theorems~\citep{czarnecki2017sobolev}.
+\end{remark}
+
+
+\subsection{Saliency as a Tractable Jacobian Approximation}\label{sec:saliency-approx}
+
+The Jacobian $J(x) \in \mathbb{R}^{V \times (L \cdot d)}$ is intractable for LLMs. For a model with vocabulary $V \approx 150{,}000$, sequence length $L = 512$, and hidden dimension $d = 4096$, the Jacobian contains over $3 \times 10^{11}$ entries. Computing or storing it is infeasible, and matching it directly requires teacher and student to share the same hidden dimension $d$---a condition violated in most practical distillation settings.
+
+We observe that the Jacobian can be partitioned into $L$ blocks, one per input position:
+$J(x) = [J^{(1)}(x) \;\; J^{(2)}(x) \;\; \cdots \;\; J^{(L)}(x)]$,
+where $J^{(j)}(x) \in \mathbb{R}^{V \times d}$ captures how the output distribution changes when the $j$-th input embedding is perturbed. The saliency at position $j$ is precisely the Frobenius norm of this block: $s_j = \|J^{(j)}(x)\|_F$.
+Saliency thus compresses each $V \times d$ block into a single scalar, retaining which positions matter while discarding the directional structure of how they matter.
+
+\begin{theorem}[Saliency as a Jacobian lower bound]\label{thm:saliency-bound}
+For any teacher $f_T$ and student $f_S$:
+\begin{equation}\label{eq:saliency-bound}
+\|\mathbf{s}_T(x) - \mathbf{s}_S(x)\|_2^2 \leq \|J_T(x) - J_S(x)\|_F^2.
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+By the triangle inequality applied to the Frobenius norm of each block:
+\begin{equation}
+\|J_T(x) - J_S(x)\|_F^2 = \sum_{j=1}^L \|J_T^{(j)} - J_S^{(j)}\|_F^2 \geq \sum_{j=1}^L \bigl(\|J_T^{(j)}\|_F - \|J_S^{(j)}\|_F\bigr)^2 = \sum_{j=1}^L (s_{T,j} - s_{S,j})^2,
+\end{equation}
+where the inequality is the reverse triangle inequality $\|A - B\|_F \geq \bigl|\|A\|_F - \|B\|_F\bigr|$.
+\end{proof}
+
+This result means that minimizing the saliency distance tightens a \emph{lower bound} on the Jacobian distance---and therefore, by Theorem~\ref{thm:taylor}, tightens a bound on the neighborhood error. Importantly, the saliency vector $\mathbf{s}(x) \in \mathbb{R}^L$ has the same dimension for teacher and student regardless of their hidden sizes, eliminating the need for dimensional alignment.
+
+
+\subsection{Saliency Alignment Loss}\label{sec:sagd-loss}
+
+To directly reduce the first-order term in Eq.~\eqref{eq:taylor}, we introduce a saliency alignment loss that encourages the student's input dependence pattern to match the teacher's:
+\begin{equation}\label{eq:sal-loss}
+\mathcal{L}_\mathrm{sal} = \frac{1}{B} \sum_{i=1}^{B} \left(1 - \frac{\mathbf{s}_T(x_i) \cdot \mathbf{s}_S(x_i)}{\|\mathbf{s}_T(x_i)\| \, \|\mathbf{s}_S(x_i)\|}\right).
+\end{equation}
+
+We use cosine distance rather than MSE or KL divergence on normalized distributions. MSE is sensitive to absolute scale: teacher and student models of different sizes naturally produce saliency vectors of different magnitudes, and MSE would be dominated by this scale mismatch rather than by differences in which positions are important. KL divergence, used by TSD~\citep{dehigahawattage2026learning}, requires normalizing saliency into a probability distribution via softmax, which discards magnitude information entirely---a teacher that strongly depends on its prompt and one that barely uses it would look identical after normalization. Cosine distance captures the \emph{pattern} of input dependence (which positions matter relative to each other) without being confounded by scale.
+
+To make $\mathcal{L}_\mathrm{sal}$ effective as a training objective, the student saliency must be \emph{differentiable} with respect to model parameters. We compute it using \texttt{torch.autograd.grad} with \texttt{create\_graph=True}, which constructs a second-order computation graph allowing gradients to flow from $\mathcal{L}_\mathrm{sal}$ back through the saliency computation into the student's parameters. Teacher saliency is precomputed once (the teacher is frozen) and requires no second-order computation.
+
+
+\subsection{Saliency-Guided Sample Reweighting}\label{sec:sagd-reweight}
+
+The alignment loss addresses the first-order term in Eq.~\eqref{eq:taylor} directly. But the zero-order term---the standard KL loss---treats all samples equally, even though some samples pose a much greater neighborhood risk than others. We now show how saliency information can also guide the zero-order optimization.
+
+Consider the worst-case neighborhood error over all training samples:
+\begin{equation}\label{eq:worst-case}
+\max_{i} \left[ D_\mathrm{KL}(f_T(x_i) \| f_S(x_i)) + \epsilon \, \|J_T(x_i) - J_S(x_i)\|_F \right].
+\end{equation}
+Samples with a large Jacobian gap have a loose neighborhood bound, regardless of how well their outputs are matched. Allocating more training effort to these samples---prioritizing them in the KL objective---tightens the overall worst-case guarantee.
+
+\begin{theorem}[Reweighting as distributionally robust optimization]\label{thm:dro}
+Let $w_i \propto \exp(\mathrm{JSD}(\hat{\mathbf{s}}_T^i, \hat{\mathbf{s}}_S^i) / \tau_w)$ be saliency-divergence-based sample weights. The weighted KL objective $\sum_i w_i \cdot D_\mathrm{KL}(f_T(x_i) \| f_S(x_i))$ is equivalent to the Lagrangian relaxation of the minimax problem~\eqref{eq:worst-case}, where the saliency divergence serves as a tractable proxy for the Jacobian gap and $\tau_w$ controls the strength of robustness.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+The Lagrangian relaxation of $\min_{f_S} \max_i [\mathrm{KL}_i + \epsilon \cdot g_i]$, where $g_i$ is the Jacobian gap, yields $\min_{f_S} \sum_i \lambda_i \mathrm{KL}_i$ with multipliers $\lambda_i$ increasing in $g_i$. Substituting the saliency divergence as a lower-bound proxy for $g_i$ and parameterizing the multipliers via a softmax with temperature $\tau_w$ gives the stated form. See Appendix~\ref{app:proofs} for the full derivation.
+\end{proof}
+
+Concretely, the per-sample saliency divergence is measured by the Jensen--Shannon divergence (JSD) between the teacher's and student's normalized saliency distributions $\hat{\mathbf{s}}_T, \hat{\mathbf{s}}_S$. The sample weights are:
+\begin{equation}\label{eq:weights}
+w_i = \frac{\exp\!\left(\mathrm{JSD}(\hat{\mathbf{s}}_T^i, \hat{\mathbf{s}}_S^i) \,/\, \tau_w\right)}{\frac{1}{B}\sum_{j=1}^B \exp\!\left(\mathrm{JSD}(\hat{\mathbf{s}}_T^j, \hat{\mathbf{s}}_S^j) \,/\, \tau_w\right)},
+\end{equation}
+normalized so that $\frac{1}{B}\sum_i w_i = 1$. Samples where the student attends to different input tokens than the teacher receive higher weight. The temperature $\tau_w$ controls how aggressively the reweighting concentrates on misaligned samples: $\tau_w \to 0$ reduces to hard example mining; $\tau_w \to \infty$ recovers uniform weighting (standard KD).
+
+
+\subsection{Complete Objective}\label{sec:full-loss}
+
+SaGD combines both components into a single objective:
+\begin{equation}\label{eq:sagd-full}
+\mathcal{L}_\mathrm{SaGD} = \underbrace{\sum_{i=1}^B w_i \cdot D_\mathrm{KL}(f_T(x_i) \| f_S(x_i))}_{\text{saliency-guided KL (zero-order + DRO)}} + \;\lambda \cdot \underbrace{\frac{1}{B}\sum_{i=1}^B \left(1 - \cos(\mathbf{s}_T^i, \mathbf{s}_S^i)\right)}_{\text{saliency alignment (first-order)}},
+\end{equation}
+where $\lambda$ controls the relative weight of first-order matching.
+
+\paragraph{Complementarity of the two components.}
+The alignment loss and the reweighting target different aspects of the neighborhood error bound in Theorem~\ref{thm:taylor}.
+The alignment loss directly reduces $\|J_T(x) - J_S(x)\|_F$ (via its saliency lower bound), tightening the bound for \emph{all} samples.
+The reweighting does not affect the Jacobian gap itself but ensures that the zero-order term $D_\mathrm{KL}(f_T(x) \| f_S(x))$ is small precisely where the Jacobian gap is large---preventing the worst-case neighborhood error from being dominated by samples that happen to have large first-order gaps.
+Neither component alone achieves both effects; their combination addresses both terms simultaneously.
+We verify this empirically in the ablation study (Section~\ref{sec:ablation}).
+
+
+\subsection{Practical Considerations}\label{sec:practical}
+
+\paragraph{Teacher saliency precomputation.}
+Since the teacher is frozen throughout training, $\mathbf{s}_T(x_i)$ needs to be computed only once per training sample.
+We precompute all teacher saliencies before training and store them indexed by sample.
+This one-time cost is approximately equal to one training epoch of standard KD.
+
+\paragraph{Student saliency computation.}
+The student saliency is computed every $N$ training steps (not every step) to limit overhead. On steps where saliency is not computed, the training reduces to standard KL with uniform weighting, identical to the baseline.
+On saliency steps, we perform two forward--backward passes through the student:
+(1) a standard forward pass for KL loss computation, and
+(2) a saliency-specific forward pass through \texttt{inputs\_embeds} with \texttt{create\_graph=True} for the differentiable alignment loss, plus a non-differentiable pass for the reweighting signal.
+The non-differentiable saliency for reweighting is computed separately to avoid unnecessary second-order cost on the reweighting path.
+With $N = 5$, the total overhead is approximately 40\% relative to standard KD.
+
+\paragraph{Algorithm.}
+The complete training procedure is summarized in Algorithm~\ref{alg:sagd}.
+
+\begin{algorithm}[t]
+\caption{SaGD Training}\label{alg:sagd}
+\begin{algorithmic}[1]
+\REQUIRE Teacher $f_T$ (frozen), student $f_S$, training set $\{x_i\}$, cached teacher saliency $\{\mathbf{s}_T^i\}$
+\REQUIRE Hyperparameters: $\lambda$, $\tau_w$, update frequency $N$
+\FOR{each training step $t$}
+    \STATE Sample mini-batch $\mathcal{B} = \{x_i\}_{i=1}^B$
+    \STATE $\mathbf{t}_i \leftarrow f_T(x_i)$, $\;\mathbf{s}_i \leftarrow f_S(x_i)$ \hfill \textit{// teacher and student forward}
+    \IF{$t \bmod N = 0$}
+        \STATE $\mathbf{s}_S^i \leftarrow \textsc{SaliencyDiff}(f_S, x_i)$ for $i \in \mathcal{B}$ \hfill \textit{// differentiable student saliency}
+        \STATE $\tilde{\mathbf{s}}_S^i \leftarrow \textsc{Saliency}(f_S, x_i)$ for $i \in \mathcal{B}$ \hfill \textit{// non-differentiable, for reweighting}
+        \STATE Retrieve $\mathbf{s}_T^i$ from cache for $i \in \mathcal{B}$
+        \STATE $w_i \leftarrow \mathrm{softmax}\!\left(\mathrm{JSD}(\hat{\mathbf{s}}_T^i, \hat{\tilde{\mathbf{s}}}_S^i) / \tau_w\right) \times B$ \hfill \textit{// sample weights (detached)}
+        \STATE $\mathcal{L}_\mathrm{sal} \leftarrow \frac{1}{B}\sum_{i} (1 - \cos(\mathbf{s}_T^i, \mathbf{s}_S^i))$ \hfill \textit{// alignment loss (differentiable)}
+        \STATE $\mathcal{L} \leftarrow \sum_i w_i \cdot D_\mathrm{KL}(\mathbf{t}_i \| \mathbf{s}_i) + \lambda \cdot \mathcal{L}_\mathrm{sal}$
+    \ELSE
+        \STATE $\mathcal{L} \leftarrow \frac{1}{B}\sum_i D_\mathrm{KL}(\mathbf{t}_i \| \mathbf{s}_i)$ \hfill \textit{// standard KD step}
+    \ENDIF
+    \STATE Update $f_S$ via $\nabla_{f_S} \mathcal{L}$
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+
+\subsection{Connection to Prior Work}\label{sec:unification}
+
+Our theoretical framework provides a unifying lens for several prior approaches to knowledge transfer.
+Table~\ref{tab:unification} situates each method within the Taylor expansion framework according to three axes: which order of the expansion it targets, how it handles the intractability of the Jacobian, and whether the derivative information is used as a direct training loss or as a signal for some other purpose.
+
+% \begin{table}[t]
+% \centering
+% \caption{Unification of prior work through the Taylor expansion framework. ``Order'' indicates which term of the neighborhood error bound (Theorem~\ref{thm:taylor}) the method targets. ``Compression'' indicates how the full Jacobian is approximated. ``Usage'' indicates whether derivative information serves as a direct loss or as a sample reweighting signal.}\label{tab:unification}
+% \vspace{4pt}
+% \small
+% \begin{tabular}{@{}lccccc@{}}
+% \toprule
+% Method & Order & Compression & Usage & Domain & Theory \\
+% \midrule
+% Standard KD~\citep{hinton2015distilling} & 0th & --- & Loss & General & --- \\
+% Sobolev Training~\citep{czarnecki2017sobolev} & 1st & None (full $J$) & Loss & Regression & \checkmark \\
+% Jacobian Matching~\citep{srinivas2018knowledge} & 1st & None (full $J$) & Loss & CNN & \checkmark \\
+% GKD~\citep{wang2022gkd} & 1st & None (full $\nabla$) & Loss & BERT & --- \\
+% AD-KD~\citep{wu2023adkd} & 1st & IG attribution & Loss & BERT & --- \\
+% TSD~\citep{dehigahawattage2026learning} & 1st & Saliency dist.\ (KL) & Loss & Time series & --- \\
+% DA-KD~\citep{dakd2025} & 0th & --- & Reweight & LLM & --- \\
+% \midrule
+% \textbf{SaGD} (ours) & \textbf{0th + 1st} & \textbf{Saliency (cosine)} & \textbf{Loss + Reweight} & \textbf{LLM} & \checkmark \\
+% \bottomrule
+% \end{tabular}
+% \end{table}
+
+Sobolev Training~\citep{czarnecki2017sobolev} and Jacobian Matching~\citep{srinivas2018knowledge} established the theoretical value of derivative matching but operate on the full Jacobian, which is feasible only for small models with matching architectures.
+AD-KD~\citep{wu-etal-2023-ad} and GKD~\citep{wang2022gkd} adapted derivative alignment to language model compression, but are restricted to encoder-only classification and require matching hidden dimensions.
+TSD~\citep{dehigahawattage2026learning} introduced saliency alignment for time series, but uses KL on normalized distributions (losing magnitude information) and does not employ reweighting.
+DA-KD~\citep{dakd2025} uses sample reweighting for LLM distillation, but the reweighting signal is the output KL divergence---a zero-order quantity---rather than a first-order saliency signal.
+
+SaGD is, to our knowledge, the first method that (i) operates in the decoder-only LLM generation setting, (ii) uses saliency divergence (a first-order signal) for sample reweighting, (iii) combines alignment loss and reweighting as dual channels targeting different terms of the same theoretical bound, and (iv) provides a formal theoretical framework connecting all these choices.
+

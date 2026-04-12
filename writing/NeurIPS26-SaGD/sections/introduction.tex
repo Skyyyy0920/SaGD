@@ -1,0 +1,92 @@
+% !TEX root = ../neurips_2026.tex
+
+\section{Introduction}
+\label{sec:intro}
+
+Knowledge distillation (KD) compresses a large \emph{teacher} language model into a smaller \emph{student} by training the student to match the teacher's output distribution~\citep{hinton2015distilling}.
+For autoregressive LLMs, this amounts to minimizing the per-token KL divergence between teacher and student next-token distributions across a training corpus.
+Recent advances have refined the divergence measure~\citep{gu2024minillm, agarwal2024gkd, ko2024distillm}, introduced adaptive loss functions~\citep{wu2025akl}, and explored difficulty-aware curricula~\citep{dakd2025}, steadily closing the quality gap between teacher and student.
+
+Yet all these methods share a fundamental limitation: they constrain \emph{what} the student predicts but not \emph{why}.
+Consider a reading comprehension task where the teacher correctly answers ``Paris'' by attending to the sentence ``The capital of France is Paris.''
+A student trained with standard KD may produce the same answer by latching onto the keyword ``France'' in the question---a shallow shortcut that yields identical output KL yet fails on rephrased or adversarial inputs where the shortcut breaks.
+The crux is that output-level matching provides no guarantee about which input tokens drive the prediction.
+
+\paragraph{The Jacobian gap.}
+We formalize this observation through function approximation theory.
+Let $f_T$ and $f_S$ denote the teacher and student mappings from input embeddings to output log-probabilities.
+Standard KD minimizes $D_{\kl}(f_T(x) \| f_S(x))$ at each training point $x$---a \emph{zero-order} (pointwise) constraint.
+A first-order Taylor expansion at a perturbed input $x + \delta$ ($\|\delta\| \leq \epsilon$) reveals:
+\begin{equation}
+  D_{\kl}\bigl(f_T(x{+}\delta) \,\|\, f_S(x{+}\delta)\bigr)
+  \;\leq\;
+  \underbrace{D_{\kl}\bigl(f_T(x) \,\|\, f_S(x)\bigr)}_{\text{zero-order: standard KD}}
+  \;+\; \epsilon \cdot
+  \underbrace{\|J_T(x) - J_S(x)\|_F}_{\text{first-order: Jacobian gap}}
+  \;+\; O(\epsilon^2),
+  \label{eq:taylor-intro}
+\end{equation}
+where $J_T, J_S$ are the input--output Jacobians.
+Standard KD drives the first term to zero but leaves the Jacobian gap entirely unconstrained.
+In approximation-theoretic terms, KD achieves $L^2$ convergence but not \emph{Sobolev} $W^{1,2}$ convergence---the latter being necessary to control the student's behavior in the input neighborhood~\citep{czarnecki2017sobolev}.
+
+\paragraph{Why not just match the Jacobian?}
+For an LLM with vocabulary size $V$, sequence length $L$, and hidden dimension $d$, the full Jacobian $J \in \R^{V \times (L \cdot d)}$ has on the order of $10^{11}$ entries.
+Explicit computation, storage, or alignment is intractable.
+Prior work on Jacobian matching in KD has been limited to small encoder-only models~\citep{srinivas2018knowledge, wang2022gkd} or restricted to classification tasks where the output is a single vector~\citep{wu-etal-2023-ad}.
+No existing method achieves Jacobian-level matching for decoder-only LLM generation.
+
+\paragraph{Key insight: noise as an implicit Jacobian probe.}
+We build on a classical result by \citet{srinivas2018knowledge}: for MSE loss on classification, the expected loss under Gaussian input noise recovers the Jacobian Frobenius norm.
+We extend this principle to the autoregressive, token-level KL setting of LLM distillation.
+Specifically, we show (Theorem~\ref{thm:noise-identity}) that
+\begin{equation}
+  \E_{\xi \sim \mathcal{N}(0, \sigma^2 I)}\bigl[D_{\kl}\bigl(f_T(x{+}\xi) \,\|\, f_S(x{+}\xi)\bigr)\bigr]
+  \;=\;
+  D_{\kl}\bigl(f_T(x) \,\|\, f_S(x)\bigr)
+  \;+\; \frac{\sigma^2}{2} \sum_{t \in \cR} \cF_t(x)
+  \;+\; O(\sigma^4),
+  \label{eq:noise-identity-intro}
+\end{equation}
+where $\cF_t(x) = \sum_v p_T^v \|\nabla_x \log p_T^v - \nabla_x \log p_S^v\|^2$ is a Fisher-weighted score matching term that captures the per-position Jacobian difference, and $\cR$ denotes response token positions.
+By simply evaluating KL on noise-perturbed embeddings, we \emph{implicitly} match the full Jacobian---without computing it, without second-order gradients, and without requiring teacher and student to share the same hidden dimension.
+
+\paragraph{Saliency-Guided Knowledge Distillation (\sagd{}).}
+Building on this insight, we propose \sagd{}, which augments standard KD with two complementary mechanisms:
+
+\begin{enumerate}
+\item \textbf{Noise-injected KL (implicit Jacobian matching).}
+  At every $N$-th training step, we add position-adaptive Gaussian noise to input embeddings and compute KL between teacher and student on the perturbed inputs.
+  The noise scale at each input position is proportional to the local saliency disagreement between teacher and student, concentrating the implicit Jacobian probe where it matters most.
+  This upgrades the distillation guarantee from $L^2$ to Sobolev $W^{1,2}$.
+
+\item \textbf{Saliency-guided sample reweighting (DRO).}
+  We compute \emph{input saliency}---the $\ell_2$-norm of the embedding gradient of the response log-probability---for both teacher and student, and use their Jensen--Shannon divergence as a per-sample difficulty measure.
+  Samples where teacher and student attend to different tokens receive higher training weight.
+  We show this corresponds to entropy-regularized distributionally robust optimization that minimizes the worst-case neighborhood error across the training set (Theorem~\ref{thm:dro}).
+\end{enumerate}
+
+Neither mechanism alone is sufficient.
+Noise KL tightens the Jacobian bound uniformly across all samples; reweighting allocates more optimization budget to samples with the loosest bounds.
+Together, they ensure both that the student's input sensitivity matches the teacher's (first-order) and that this matching is prioritized where it is most needed (robust allocation).
+
+\paragraph{Evidence concentration: a diagnostic beyond outputs.}
+Standard evaluation of distilled models relies entirely on output-level metrics (ROUGE-L, Exact Match, perplexity).
+We introduce \emph{evidence concentration}---the fraction of the student's input saliency that falls on the ground-truth answer span---as a diagnostic for whether the student \emph{reasons} like the teacher.
+On SQuAD~2.0, we find that standard KD students dramatically over-concentrate saliency on answer tokens (EC\,$=$\,0.169 vs.\ teacher's 0.055), indicating shortcut learning.
+\sagd{} reduces this to 0.083, bringing the student's reasoning pattern significantly closer to the teacher's holistic evidence utilization.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+\item \textbf{Theory.}
+  We derive the noise--Jacobian identity for autoregressive token-level KL (extending \citealt{srinivas2018knowledge} beyond MSE/classification), establish a neighborhood error bound connecting noise KL to Sobolev $W^{1,2}$ convergence (Theorem~\ref{thm:neighborhood}), and formalize saliency-guided reweighting as entropy-regularized DRO on the Jacobian gap (Theorem~\ref{thm:dro}).
+
+\item \textbf{Method.}
+  We propose \sagd{}, combining noise-injected KL for implicit Jacobian matching with saliency-guided sample reweighting.
+  The method requires no architectural constraints, no second-order gradients, and adds ${\sim}40\%$ overhead relative to standard KD (with saliency computed every $N{=}5$ steps).
+
+\item \textbf{Experiments.}
+  On SQuAD~2.0 and Dolly-15K with Qwen3-8B $\to$ 0.6B/1.7B, \sagd{} improves Exact Match, Token F1, and ROUGE-L over standard KD and six recent baselines.
+  Evidence concentration analysis confirms that improvements stem from preserving the teacher's internal reasoning, not merely output mimicry.
+  Ablations isolate the contributions of noise KL and reweighting, and hyperparameter sweeps validate robustness.
+\end{enumerate}

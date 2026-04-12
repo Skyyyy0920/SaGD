@@ -1,0 +1,14 @@
+refs/
+__pycache__/
+*.pyc
+
+# LaTeX build artifacts
+writing/**/*.aux
+writing/**/*.log
+writing/**/*.out
+writing/**/*.bbl
+writing/**/*.blg
+writing/**/*.fdb_latexmk
+writing/**/*.fls
+writing/**/*.synctex.gz
+writing/**/*.pdf

@@ -102,14 +102,25 @@ def generate_responses(
             for j, idx in enumerate(batch_indices):
                 gen_ids = outputs[j, max_prompt_len:]
                 generated = tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+                # Strip Qwen3 thinking blocks: <think>...</think>
+                # These models emit a reasoning trace before the actual
+                # response. The trace dominates the text and destroys
+                # ROUGE-L / EM / F1 if not removed.
+                generated = re.sub(
+                    r"<think>.*?</think>", "", generated, flags=re.DOTALL,
+                ).strip()
+                # Fallback: if <think> appears without closing </think>
+                # (truncated generation), drop everything from <think> onward.
+                if "<think>" in generated:
+                    generated = generated.split("<think>")[0].strip()
+
                 # Only extractive QA strips to first line (answers are short spans).
                 # All other tasks (instruction-following, summarization, math
                 # reasoning) keep full generated text.
                 category = metas[j]["category"]
                 if category == "extractive_qa":
                     generated = generated.split("\n")[0].strip()
-                else:
-                    generated = generated.strip()
                 results.append({
                     "index": idx,
                     "instruction": metas[j]["instruction"],

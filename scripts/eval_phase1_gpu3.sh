@@ -129,12 +129,12 @@ for method in methods:
         if bench_scores[b]:
             m = np.mean(bench_scores[b])
             s = np.std(bench_scores[b])
-            row += f' | {m:>5.1f}±{s:>4.1f}'
+            row += f' | {m:>5.2f}±{s:>4.2f}'
             avgs.append(m)
         else:
             row += f' |       —     '
     if avgs:
-        row += f' | {np.mean(avgs):>5.1f}'
+        row += f' | {np.mean(avgs):>5.2f}'
     print(row)
 "
 

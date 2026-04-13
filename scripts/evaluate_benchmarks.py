@@ -25,8 +25,10 @@ from sagd.data import EvalInstructionDataset
 from sagd.evaluation import compute_rouge, generate_responses
 from sagd.models import load_student
 
-# VicunaEval removed: no reliable HF source; it requires GPT-4 judging, not ROUGE-L.
-BENCHMARKS = ["dolly_eval", "self_inst", "super_natural", "unnatural"]
+# Benchmarks for DA-KD-style evaluation.
+# self_inst removed: yizhongw/self_instruct loading script deprecated on HF.
+# vicuna_eval removed: no reliable HF source; requires GPT-4 judging, not ROUGE-L.
+BENCHMARKS = ["dolly_eval", "super_natural", "unnatural"]
 
 
 def parse_args() -> argparse.Namespace:

@@ -106,7 +106,7 @@ python -c "
 import json, os, numpy as np
 
 methods = ['sft', 'standard_kd', 'reverse_kl', 'seqkd', 'gkd', 'distillm', 'dakd', 'sagd']
-benchmarks = ['dolly_eval', 'self_inst', 'super_natural', 'unnatural']
+benchmarks = ['dolly_eval', 'super_natural', 'unnatural']
 seeds = [42, 123, 456, 789, 2024]
 tag = '${STUDENT_TAG}'
 

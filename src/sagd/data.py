@@ -672,32 +672,65 @@ class EvalInstructionDataset(Dataset):
     def _load_self_inst(self, tokenizer, max_seq_len, max_samples, seed):
         """Self-Instruct human evaluation set (252 samples, used by DA-KD).
 
-        Uses the ``human_eval`` config of yizhongw/self_instruct.
-        Each row has fields ``instruction`` and ``instances`` (list of dicts
-        with ``input``/``output``).
+        Primary: ``yizhongw/self_instruct`` human_eval config.
+        This dataset's loading script is deprecated on newer ``datasets``
+        versions, so fall back gracefully.
         """
-        raw = load_dataset("yizhongw/self_instruct", "human_eval", split="train")
+        loaded = False
+        for name, config in [
+            ("yizhongw/self_instruct", "human_eval"),
+            ("yizhongw/self_instruct", "self_instruct"),
+        ]:
+            try:
+                raw = load_dataset(name, config, split="train", trust_remote_code=True)
+                loaded = True
+                break
+            except Exception:
+                continue
+
+        if not loaded:
+            print("WARNING: Could not load Self-Instruct from any known source. Skipping.")
+            return
+
         raw = raw.shuffle(seed=seed)
         limit = max_samples if max_samples is not None else 252
         raw = raw.select(range(min(limit, len(raw))))
         for i, row in enumerate(raw):
-            instruction = row.get("instruction", "")
+            # Schema varies by config: try human_eval format first, then fallback
+            instruction = row.get("instruction", row.get("prompt", ""))
             instances = row.get("instances", [])
             if instances and len(instances) > 0:
                 inp = instances[0].get("input", "") or ""
                 out = instances[0].get("output", "") or ""
             else:
-                inp, out = "", ""
+                inp = ""
+                out = row.get("completion", "")
             self.samples.append(self._tokenize_sample(
                 tokenizer, instruction, inp, out, max_seq_len, i,
             ))
 
     def _load_super_natural(self, tokenizer, max_seq_len, max_samples, seed):
-        """Super-Natural Instructions test set (streaming, capped at 500)."""
-        raw = load_dataset(
-            "Muennighoff/super_natural_instructions", "default", split="test",
-            streaming=True,
-        )
+        """Super-Natural Instructions test set (streaming, capped at 500).
+
+        Primary: ``Muennighoff/natural-instructions`` (renamed from
+        ``Muennighoff/super_natural_instructions``).
+        """
+        loaded = False
+        for name in [
+            "Muennighoff/natural-instructions",
+            "Muennighoff/super_natural_instructions",
+        ]:
+            try:
+                raw = load_dataset(name, "default", split="test", streaming=True)
+                loaded = True
+                break
+            except Exception:
+                continue
+
+        if not loaded:
+            print("WARNING: Could not load Super-Natural Instructions. Skipping.")
+            return
+
         limit = max_samples if max_samples is not None else 500
         samples = []
         for row in raw:
@@ -716,15 +749,31 @@ class EvalInstructionDataset(Dataset):
             ))
 
     def _load_unnatural(self, tokenizer, max_seq_len, max_samples, seed):
-        """Unnatural Instructions (capped at 500 for eval)."""
+        """Unnatural Instructions (capped at 500 for eval).
+
+        The ``instances`` field is a list of dicts, each with
+        ``input``, ``output``, and ``constraints`` keys.
+        """
         raw = load_dataset("mrm8488/unnatural-instructions-full", split="train")
         raw = raw.shuffle(seed=seed)
         limit = max_samples if max_samples is not None else 500
         raw = raw.select(range(min(limit, len(raw))))
         for i, row in enumerate(raw):
             inst = row.get("instruction", "")
-            inp = row.get("input", "")
-            out = row.get("output", "")
+            # instances is a list of dicts with input/output
+            instances = row.get("instances", [])
+            if isinstance(instances, str):
+                import json as _json
+                try:
+                    instances = _json.loads(instances)
+                except Exception:
+                    instances = []
+            if instances and len(instances) > 0:
+                inp = instances[0].get("input", "") or ""
+                out = instances[0].get("output", "") or ""
+            else:
+                inp = row.get("input", "")
+                out = row.get("output", "")
             self.samples.append(self._tokenize_sample(
                 tokenizer, inst, inp, out, max_seq_len, i,
             ))

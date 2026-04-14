@@ -535,14 +535,23 @@ class Trainer:
                                 gen_input[bi, max_pl - pl:] = input_ids[bi, :pl]
                                 gen_attn[bi, max_pl - pl:] = 1
 
-                            gen_out = self.student.generate(
+                            # Suppress <think> token for Qwen3 (prevents
+                            # thinking-mode traces in on-policy generation)
+                            _think_id = self.tokenizer.convert_tokens_to_ids("<think>")
+                            _suppress = [_think_id] if _think_id is not None and _think_id != self.tokenizer.unk_token_id else None
+
+                            gen_kwargs = dict(
                                 input_ids=gen_input,
                                 attention_mask=gen_attn,
                                 max_new_tokens=max(max_new, 1),
                                 do_sample=True,
                                 temperature=1.0,
                                 pad_token_id=pad_id,
-                            )  # (B, max_pl + generated)
+                            )
+                            if _suppress is not None:
+                                gen_kwargs["suppress_tokens"] = _suppress
+
+                            gen_out = self.student.generate(**gen_kwargs)  # (B, max_pl + generated)
 
                             # Trim and build attention mask from non-pad tokens
                             gen_out = gen_out[:, :max_pl + max(max_new, 1)]

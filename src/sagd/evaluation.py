@@ -30,6 +30,23 @@ DatasetType = Union[InstructionDataset, SquadDataset, SAMSumDataset, GSM8KDatase
 # 1. Shared response generation
 # ---------------------------------------------------------------------------
 
+def _get_suppress_tokens(tokenizer: PreTrainedTokenizer) -> list[int] | None:
+    """Detect Qwen3 <think> token and return list for suppress_tokens.
+
+    Qwen3 models generate <think>...</think> reasoning traces before the
+    actual response. Suppressing the <think> token (setting its logit to
+    -inf at every step) prevents the model from ever entering thinking
+    mode, so ALL generated tokens are actual response content.
+
+    Returns None for non-Qwen3 models (no suppression needed).
+    """
+    think_token_id = tokenizer.convert_tokens_to_ids("<think>")
+    # convert_tokens_to_ids returns unk_token_id for unknown tokens
+    if think_token_id is not None and think_token_id != tokenizer.unk_token_id:
+        return [think_token_id]
+    return None
+
+
 def generate_responses(
     model: nn.Module,
     tokenizer: PreTrainedTokenizer,
@@ -44,6 +61,9 @@ def generate_responses(
     Uses ``get_metadata()`` which returns ``instruction``, ``response``,
     and ``category`` keys for both dataset types.
 
+    For Qwen3 models: suppresses the ``<think>`` token at generation time
+    to prevent thinking-mode traces from consuming the token budget.
+
     Returns a list of dicts, each with keys:
         - ``"index"``: int — dataset index
         - ``"instruction"``: str — prompt text (question for SQuAD)
@@ -53,6 +73,9 @@ def generate_responses(
     """
     model.eval()
     results: list[dict[str, str]] = []
+
+    # Suppress <think> token for Qwen3 models (prevents thinking mode)
+    suppress_tokens = _get_suppress_tokens(tokenizer)
 
     with torch.no_grad():
         for i in tqdm(range(0, len(dataset), batch_size), desc="Generating"):
@@ -91,33 +114,33 @@ def generate_responses(
             input_ids_batch = input_ids_batch.to(device)
             attention_mask_batch = attention_mask_batch.to(device)
 
-            outputs = model.generate(
+            gen_kwargs = dict(
                 input_ids=input_ids_batch,
                 attention_mask=attention_mask_batch,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 pad_token_id=pad_id,
             )
+            if suppress_tokens is not None:
+                gen_kwargs["suppress_tokens"] = suppress_tokens
+
+            outputs = model.generate(**gen_kwargs)
 
             for j, idx in enumerate(batch_indices):
                 gen_ids = outputs[j, max_prompt_len:]
                 generated = tokenizer.decode(gen_ids, skip_special_tokens=True)
 
-                # Strip Qwen3 thinking blocks: <think>...</think>
-                # These models emit a reasoning trace before the actual
-                # response. The trace dominates the text and destroys
-                # ROUGE-L / EM / F1 if not removed.
+                # Safety net: strip any residual <think>...</think> blocks
+                # (in case suppress_tokens didn't fully prevent them, e.g.
+                # if the token ID detection failed for a non-Qwen3 model
+                # that still has thinking behavior).
                 generated = re.sub(
                     r"<think>.*?</think>", "", generated, flags=re.DOTALL,
                 ).strip()
-                # Fallback: if <think> appears without closing </think>
-                # (truncated generation), drop everything from <think> onward.
                 if "<think>" in generated:
                     generated = generated.split("<think>")[0].strip()
 
                 # Only extractive QA strips to first line (answers are short spans).
-                # All other tasks (instruction-following, summarization, math
-                # reasoning) keep full generated text.
                 category = metas[j]["category"]
                 if category == "extractive_qa":
                     generated = generated.split("\n")[0].strip()

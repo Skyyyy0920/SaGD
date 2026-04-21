@@ -268,6 +268,169 @@ excluded from EC computation.
 | + Reweight only | weighted | — (λ=0) | ✓ | L² + DRO |
 | **SaGD (full)** | weighted | ✓ | ✓ | W^{1,2} + DRO |
 
+### 2.9 Gradient-PCA Data Selection (GPDS)
+
+**Motivation**: SaGD's noise KL and saliency reweighting operate at the loss/sample level
+(HOW to train), but treat all training data equally at the dataset level (WHAT to train on).
+Inspired by the Epiplexity framework (Finzi et al., 2026) — which distinguishes structural
+information (shared learnable patterns) from random information (sample-specific noise) —
+we propose selecting training samples that provide the most structurally informative
+gradient signal for the student.
+
+**Key insight**: Fine-tuning gradients are empirically low-rank (the LoRA observation).
+Different samples push the student's parameters in similar directions when they require
+similar corrections. PCA on the gradient matrix reveals the **principal gradient directions**
+— the dominant axes along which the student needs to change. Samples that span these
+principal directions contain the structural information; samples whose gradients lie in the
+residual subspace contribute only idiosyncratic, non-transferable updates.
+
+**Two contributions at different levels**:
+
+| Level | Mechanism | Signal | Theory |
+|-------|-----------|--------|--------|
+| **Loss (SaGD)** | Noise KL + saliency reweighting | Saliency divergence | Sobolev W^{1,2} + DRO |
+| **Data (GPDS)** | Gradient PCA subset selection | Loss gradient direction | Coreset + D-optimal design |
+
+#### 2.9.1 Per-Sample Projected Gradient
+
+For each training sample $x_i$, compute the KL distillation loss gradient w.r.t. student
+parameters $\theta$:
+
+$$\mathbf{g}_i = \nabla_\theta D_\text{KL}(f_T(x_i) \| f_S(x_i; \theta)) \in \mathbb{R}^{|\theta|}$$
+
+Since $|\theta|$ is enormous (~600M for Qwen3-0.6B), project via **Count Sketch** (a form
+of JL-preserving random projection):
+
+$$\tilde{\mathbf{g}}_i \in \mathbb{R}^d, \quad \tilde{g}_{i,k} = \sum_{j: h(j)=k} s(j) \cdot g_{i,j}$$
+
+where $h: \{1,...,|\theta|\} \to \{1,...,d\}$ is a hash function and $s(j) \in \{-1,+1\}$
+is a random sign. $d = 1024$ suffices by JL guarantee.
+
+**Complexity**: O(|θ|) per sample (one pass over gradient), O(d) memory for result.
+
+#### 2.9.2 Principal Gradient Analysis
+
+Stack projected gradients: $\tilde{\mathbf{G}} = [\tilde{\mathbf{g}}_1, ..., \tilde{\mathbf{g}}_n]^T \in \mathbb{R}^{n \times d}$
+
+Center and SVD: $\tilde{\mathbf{G}} - \bar{\tilde{\mathbf{g}}}^T = \mathbf{U\Sigma V}^T$
+
+- $\mathbf{v}_k$: $k$-th **principal gradient direction** in parameter space
+- $\sigma_k^2$: gradient variance along this direction
+- $u_{ik} \sigma_k$: sample $i$'s contribution to direction $k$
+- **Effective rank** $r^*$: smallest $r$ such that top-$r$ PCs explain ≥90% variance
+
+**Low-rank hypothesis** (supported by LoRA): Fine-tuning gradients concentrate in a
+low-dimensional subspace ($r^* \ll \min(n, d)$). Different samples push parameters in
+highly correlated directions because they share the same teacher-student gap structure.
+
+**Null model**: To distinguish genuine low-rank structure from projection artifacts,
+compare against random directions with matched gradient norms. If real spectrum decays
+faster than null → gradient structure is genuine.
+
+#### 2.9.3 Subspace-Spanning Selection
+
+Select subset $\mathcal{S}$ of size $K = \lfloor n \cdot \text{ratio} \rfloor$ that covers the
+principal gradient subspace.
+
+**D-optimal criterion** (maximizes information about parameter update):
+$$\mathcal{S}^* = \arg\max_{|\mathcal{S}|=K} \log\det\left(\sum_{i \in \mathcal{S}} \tilde{\mathbf{g}}_i \tilde{\mathbf{g}}_i^T + \mu \mathbf{I}\right)$$
+
+**Practical approximation** (greedy per-PC quota):
+1. Set $\text{quota}_k = K \cdot \sigma_k^2 / \sum_l \sigma_l^2$ for each PC $k = 1,...,r^*$
+2. For each PC, select top-quota_k samples by $|u_{ik}| \sigma_k$ (largest projection)
+3. Skip already-selected samples (handle overlap across PCs)
+4. Fill remaining slots with highest-loss unselected samples
+
+**Coreset guarantee**: If gradient matrix has effective rank $r^*$ with residual
+$\sigma_{r^*+1}$, and $\mathcal{S}$ spans the top-$r^*$ subspace, then:
+$$\|\mathbf{g}_\mathcal{S} - \mathbf{g}\|^2 \leq \frac{\sum_{k > r^*} \sigma_k^2}{n} + O(r^*/K)$$
+
+First term = truncation error (small if low-rank), second = sampling error.
+
+#### 2.9.4 Connection to Epiplexity
+
+The Epiplexity framework (Finzi et al., 2026) decomposes data information into:
+- **Structural** ($S_T$): compressible patterns encoded into model weights → reusable
+  circuits → OOD transfer
+- **Random** ($H_T$): irreducible unpredictability → doesn't transfer
+
+In gradient PCA terms:
+- **Top PCs** = gradient directions shared by many samples = structural updates
+  (changing parameters along these directions helps many samples simultaneously)
+- **Bottom PCs** = gradient directions unique to few samples = idiosyncratic updates
+  (changing parameters along these directions only helps specific samples)
+
+Selecting samples that span the top PCs = selecting samples with high structural
+information content, as measured by their gradient's alignment with the principal
+subspace.
+
+Prequential coding estimate: $S_T \approx$ area under the loss curve. Samples whose
+loss drops fastest during training contribute most to epiplexity. These are precisely
+the samples with large projections on the top gradient PCs — their gradient directions
+are well-represented in the principal subspace, leading to efficient loss reduction.
+
+#### 2.9.5 Complete Training Pipeline with GPDS
+
+```
+Phase 0: Precompute teacher saliency (once)
+  → data/teacher_saliency_{dataset}.pt
+
+Phase 1: Warm-up (1 epoch of standard SaGD on full dataset)
+  → Student model after initial training
+
+Phase 2: Gradient profiling + selection
+  → For each sample: forward (teacher + student) → KL loss → backward → Count Sketch
+  → SVD on projected gradient matrix
+  → Per-PC quota selection → selected_indices.pt
+  Cost: ~1 extra epoch of forward-backward passes (batch_size=1)
+
+Phase 3: Continue SaGD training on selected subset (remaining epochs)
+  → Load selected_indices.pt → torch.utils.data.Subset(dataset, indices)
+  → Standard SaGD training (noise KL + saliency reweighting) on subset only
+  → Optional: re-profile every K epochs as student evolves
+
+Compute budget:
+  Warm-up: 1 epoch
+  Profiling: ~1 epoch (batch_size=1, no optimization, just gradient collection)
+  Subset training (50% data): 4.5 epochs (= 9 remaining × 0.5)
+  Total: ~6.5 epochs vs 10 full epochs → 35% compute savings
+```
+
+#### 2.9.6 Implementation: Count Sketch Projector
+
+```python
+# Pre-generate hash tables (once, deterministic from seed)
+for each param_name, numel:
+    hash_dim[name] = randint(0, proj_dim, (numel,))   # which bucket
+    hash_sign[name] = randint(0, 2, (numel,)) * 2 - 1  # which sign
+
+# Project gradient (after loss.backward())
+projected = zeros(proj_dim)  # on GPU
+for name, p in model.named_parameters():
+    signed_grad = p.grad.view(-1) * hash_sign[name]
+    projected.scatter_add_(0, hash_dim[name], signed_grad)
+return projected  # (proj_dim,) → move to CPU for storage
+```
+
+Hash tables stored on GPU for speed. Memory: ~7GB for 600M-param model (int64 + float32).
+Total GPU budget: teacher (16GB fp16) + student (2.4GB fp32) + hash tables (7GB) + activations (~2GB) ≈ 28GB. Fits on A100 80GB.
+
+#### 2.9.7 Negative Finding: Saliency-Space PCA Does NOT Work
+
+We investigated PCA on saliency-weighted embedding differences
+$\Delta z_i = \sum_j (\hat{s}_{T,j} - \hat{s}_{S,j}) \cdot e_j$ and found:
+- Effective rank (90%): 661 / 1024 — NOT low-rank
+- Top-10 PCs explain only 24.1% of variance (vs 68.9% for null model)
+- Real spectrum is FLATTER than random (opposite of hypothesis)
+
+**Reason**: Saliency operates in input space. Different samples have different tokens,
+so saliency error directions are inherently diverse. Gradient operates in parameter space,
+where all samples share the same parameters → gradient directions can be correlated.
+
+This negative finding validates two choices:
+1. Soft saliency reweighting (not hard saliency-based selection) for SaGD
+2. Gradient space (not saliency space) for data selection
+
 ---
 
 ## 3. Registered Methods

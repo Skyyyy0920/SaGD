@@ -374,11 +374,14 @@ class Trainer:
 
         return per_sample_kl_noisy, stats
 
-    def train(self, save_dir: str) -> dict[str, list[float]]:
+    def train(self, save_dir: str, curriculum_stages: list | None = None) -> dict[str, list[float]]:
         """Run training loop.
 
         Args:
             save_dir: Directory to save checkpoints and logs.
+            curriculum_stages: Optional list of length `epochs`. Each element is a
+                list of dataset indices to train on for that epoch. If None, uses
+                the full dataset every epoch (default behavior).
 
         Returns:
             history: Dict of metric lists.
@@ -407,8 +410,16 @@ class Trainer:
         global_step = 0
 
         for epoch in range(self.epochs):
-            # DA-KD DiffUp: select data subset for this epoch
-            if self.method == "dakd" and epoch > 0:
+            # Per-epoch data subset selection (curriculum or DA-KD)
+            if curriculum_stages is not None and epoch < len(curriculum_stages):
+                # Curriculum: use the stage-specific subset for this epoch
+                stage_indices = curriculum_stages[epoch]
+                curriculum_subset = Subset(self.dataset, stage_indices)
+                epoch_dataloader = DataLoader(
+                    curriculum_subset, batch_size=self.batch_size,
+                    shuffle=True, collate_fn=collate_fn, drop_last=True,
+                )
+            elif self.method == "dakd" and epoch > 0:
                 subset = self._compute_dakd_subset(epoch)
                 if subset is not None:
                     epoch_dataloader = DataLoader(

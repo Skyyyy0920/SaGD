@@ -90,6 +90,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bdl_lambda", type=float, default=0.9,
                     help="BDL mixing coefficient for DA-KD")
 
+    # Curriculum
+    p.add_argument("--curriculum_path", type=str, default=None,
+                    help="Path to curriculum order file (.pt) from compute_curriculum.py. "
+                         "Enables staged curriculum: train on top samples first.")
+    p.add_argument("--curriculum_schedule", type=str, default="0.3,0.6,1.0",
+                    help="Comma-separated fractions for staged curriculum. "
+                         "E.g., '0.3,0.6,1.0' = 30%% for first stage, 60%% for second, "
+                         "100%% for remaining epochs. Stages are split evenly across epochs.")
+
     # Output
     p.add_argument("--output_dir", type=str, default="outputs/")
     p.add_argument("--device", type=str, default="cuda:0")
@@ -181,6 +190,36 @@ def main() -> None:
         print(f"Answer span mapping rate: {dataset.span_mapping_rate:.1%}")
     print(f"Dataset size: {len(dataset)}")
 
+    # Load curriculum if provided
+    curriculum_stages = None
+    if args.curriculum_path:
+        print(f"Loading curriculum: {args.curriculum_path}")
+        curriculum_data = torch.load(args.curriculum_path, map_location="cpu",
+                                     weights_only=False)
+        sorted_indices = curriculum_data["sorted_indices"].tolist()
+        schedule = [float(x) for x in args.curriculum_schedule.split(",")]
+        n_total = len(sorted_indices)
+
+        # Build per-epoch subset indices
+        # Split epochs evenly across stages
+        epochs_per_stage = max(1, args.epochs // len(schedule))
+        curriculum_stages = []
+        for s, frac in enumerate(schedule):
+            k = int(n_total * frac)
+            stage_indices = sorted_indices[:k]
+            n_epochs = epochs_per_stage if s < len(schedule) - 1 else (
+                args.epochs - s * epochs_per_stage)
+            for _ in range(n_epochs):
+                curriculum_stages.append(stage_indices)
+        # Pad or truncate to exactly args.epochs
+        curriculum_stages = curriculum_stages[:args.epochs]
+        while len(curriculum_stages) < args.epochs:
+            curriculum_stages.append(sorted_indices)
+
+        for e, stage in enumerate(curriculum_stages):
+            print(f"  Epoch {e+1}: {len(stage)}/{n_total} samples "
+                  f"({len(stage)/n_total*100:.0f}%)")
+
     # Config dict
     config = {
         "method": args.method,
@@ -197,6 +236,8 @@ def main() -> None:
         "fp16": args.fp16,
         "log_every": args.log_every,
         "save_every_n_epochs": args.save_every_n_epochs,
+        "curriculum_path": args.curriculum_path,
+        "curriculum_schedule": args.curriculum_schedule if args.curriculum_path else None,
         "teacher_saliency_path": args.teacher_saliency_path,
         "lambda_noise": args.lambda_noise,
         "noise_sigma": args.noise_sigma,
@@ -215,7 +256,7 @@ def main() -> None:
 
     # Train
     trainer = Trainer(teacher, student, s_tokenizer, dataset, config)
-    history = trainer.train(save_dir)
+    history = trainer.train(save_dir, curriculum_stages=curriculum_stages)
 
     # Evaluate
     if not args.skip_eval:

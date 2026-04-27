@@ -153,7 +153,7 @@ run_train() {
         echo "--- Seed $SEED ---"
 
         # A. SaGD (no curriculum, baseline for our method)
-        CKPT="${OUTPUT_BASE}/sagd_random/seed_${SEED}/student_final.pt"
+        CKPT="${OUTPUT_BASE}/sagd_random/sagd/seed_${SEED}/student_final.pt"
         if [ -f "$CKPT" ]; then
             echo "[TRAIN] SKIP sagd_random/seed_${SEED} (exists)"
         else
@@ -166,7 +166,7 @@ run_train() {
         fi
 
         # B. SaGD + saliency PC curriculum
-        CKPT="${OUTPUT_BASE}/sagd_sal_curriculum/seed_${SEED}/student_final.pt"
+        CKPT="${OUTPUT_BASE}/sagd_sal_curriculum/sagd/seed_${SEED}/student_final.pt"
         if [ -f "$CKPT" ]; then
             echo "[TRAIN] SKIP sagd_sal_curriculum/seed_${SEED} (exists)"
         else
@@ -181,7 +181,7 @@ run_train() {
         fi
 
         # C. SaGD + gradient PC curriculum
-        CKPT="${OUTPUT_BASE}/sagd_grad_curriculum/seed_${SEED}/student_final.pt"
+        CKPT="${OUTPUT_BASE}/sagd_grad_curriculum/sagd/seed_${SEED}/student_final.pt"
         if [ -f "$CKPT" ]; then
             echo "[TRAIN] SKIP sagd_grad_curriculum/seed_${SEED} (exists)"
         else
@@ -196,7 +196,7 @@ run_train() {
         fi
 
         # D. Standard KD + gradient PC curriculum (test curriculum alone)
-        CKPT="${OUTPUT_BASE}/kd_grad_curriculum/seed_${SEED}/student_final.pt"
+        CKPT="${OUTPUT_BASE}/kd_grad_curriculum/standard_kd/seed_${SEED}/student_final.pt"
         if [ -f "$CKPT" ]; then
             echo "[TRAIN] SKIP kd_grad_curriculum/seed_${SEED} (exists)"
         else
@@ -211,7 +211,7 @@ run_train() {
         fi
 
         # E. SaGD ablation: noise-only (τ_w=100 ≈ uniform)
-        CKPT="${OUTPUT_BASE}/sagd_noise_only/seed_${SEED}/student_final.pt"
+        CKPT="${OUTPUT_BASE}/sagd_noise_only/sagd/seed_${SEED}/student_final.pt"
         if [ -f "$CKPT" ]; then
             echo "[TRAIN] SKIP sagd_noise_only/seed_${SEED} (exists)"
         else
@@ -227,7 +227,7 @@ run_train() {
         fi
 
         # F. SaGD ablation: reweight-only (λ=0)
-        CKPT="${OUTPUT_BASE}/sagd_reweight_only/seed_${SEED}/student_final.pt"
+        CKPT="${OUTPUT_BASE}/sagd_reweight_only/sagd/seed_${SEED}/student_final.pt"
         if [ -f "$CKPT" ]; then
             echo "[TRAIN] SKIP sagd_reweight_only/seed_${SEED} (exists)"
         else
@@ -253,36 +253,41 @@ run_eval() {
     echo ""
     echo "===== Stage 3: Evaluation ====="
 
-    METHODS_TO_EVAL=(
-        sagd_random
-        sagd_sal_curriculum
-        sagd_grad_curriculum
-        kd_grad_curriculum
-        sagd_noise_only
-        sagd_reweight_only
-    )
+    # train.py creates: {output_dir}/{method}/seed_{seed}/
+    # So actual paths have an extra {method_name}/ subdir:
+    #   sagd_random     → sagd_random/sagd/seed_X
+    #   kd_grad_curriculum → kd_grad_curriculum/standard_kd/seed_X
+    declare -A METHOD_SUBDIR
+    METHOD_SUBDIR[sagd_random]="sagd"
+    METHOD_SUBDIR[sagd_sal_curriculum]="sagd"
+    METHOD_SUBDIR[sagd_grad_curriculum]="sagd"
+    METHOD_SUBDIR[kd_grad_curriculum]="standard_kd"
+    METHOD_SUBDIR[sagd_noise_only]="sagd"
+    METHOD_SUBDIR[sagd_reweight_only]="sagd"
 
-    for METHOD in "${METHODS_TO_EVAL[@]}"; do
+    for CONFIG in sagd_random sagd_sal_curriculum sagd_grad_curriculum \
+                  kd_grad_curriculum sagd_noise_only sagd_reweight_only; do
+        SUB="${METHOD_SUBDIR[$CONFIG]}"
         for SEED in "${SEEDS[@]}"; do
-            CKPT="${OUTPUT_BASE}/${METHOD}/seed_${SEED}/student_final.pt"
-            EVAL_OUT="${OUTPUT_BASE}/${METHOD}/seed_${SEED}/benchmark_rouge.json"
+            CKPT="${OUTPUT_BASE}/${CONFIG}/${SUB}/seed_${SEED}/student_final.pt"
+            EVAL_OUT="${OUTPUT_BASE}/${CONFIG}/${SUB}/seed_${SEED}/benchmark_rouge.json"
 
             if [ ! -f "$CKPT" ]; then
-                echo "[EVAL] SKIP ${METHOD}/seed_${SEED} (no checkpoint)"
+                echo "[EVAL] SKIP ${CONFIG}/seed_${SEED} (no checkpoint)"
                 continue
             fi
             if [ -f "$EVAL_OUT" ]; then
-                echo "[EVAL] SKIP ${METHOD}/seed_${SEED} (eval exists)"
+                echo "[EVAL] SKIP ${CONFIG}/seed_${SEED} (eval exists)"
                 continue
             fi
 
-            echo "[EVAL] >>> ${METHOD}/seed_${SEED}"
+            echo "[EVAL] >>> ${CONFIG}/${SUB}/seed_${SEED}"
             python scripts/evaluate_benchmarks.py \
                 --student_model "$STUDENT" \
                 --student_ckpt "$CKPT" \
                 --output_path "$EVAL_OUT" \
                 --device "$DEVICE" \
-                2>&1 | tee "${LOG_DIR}/eval_${METHOD}_s${SEED}.log"
+                2>&1 | tee "${LOG_DIR}/eval_${CONFIG}_s${SEED}.log"
         done
     done
 
@@ -294,25 +299,31 @@ run_eval() {
     python -c "
 import json, numpy as np, os
 
-methods = ['sagd_random', 'sagd_sal_curriculum', 'sagd_grad_curriculum',
-           'kd_grad_curriculum', 'sagd_noise_only', 'sagd_reweight_only']
+configs = {
+    'sagd_random': 'sagd',
+    'sagd_sal_curriculum': 'sagd',
+    'sagd_grad_curriculum': 'sagd',
+    'kd_grad_curriculum': 'standard_kd',
+    'sagd_noise_only': 'sagd',
+    'sagd_reweight_only': 'sagd',
+}
 seeds = [42, 123, 456]
 base = '${OUTPUT_BASE}'
 
-header = f\"{'Method':<25} | {'DollyEval':>10} | {'S-NatInst':>10} | {'Unnatural':>10} | {'Avg':>10}\"
+header = f\"{'Config':<25} | {'DollyEval':>14} | {'S-NatInst':>14} | {'Unnatural':>14} | {'Avg':>8}\"
 print(header)
 print('-' * len(header))
 
-for method in methods:
+for config, sub in configs.items():
     benchmarks = {'dolly_eval': [], 'super_natural': [], 'unnatural': []}
     for seed in seeds:
-        path = os.path.join(base, method, f'seed_{seed}', 'benchmark_rouge.json')
+        path = os.path.join(base, config, sub, f'seed_{seed}', 'benchmark_rouge.json')
         try:
             with open(path) as f:
                 data = json.load(f)
             for b in benchmarks:
                 if b in data:
-                    benchmarks[b].append(data[b].get('rouge_l_f', 0))
+                    benchmarks[b].append(data[b].get('rouge_l_f', 0) * 100)
         except:
             pass
     def fmt(lst):
@@ -320,7 +331,7 @@ for method in methods:
         return f'{np.mean(lst):.2f}±{np.std(lst):.2f}'
     avgs = [np.mean(v) for v in benchmarks.values() if v]
     avg_str = f'{np.mean(avgs):.2f}' if avgs else '—'
-    print(f\"{method:<25} | {fmt(benchmarks['dolly_eval']):>10} | {fmt(benchmarks['super_natural']):>10} | {fmt(benchmarks['unnatural']):>10} | {avg_str:>10}\")
+    print(f\"{config:<25} | {fmt(benchmarks['dolly_eval']):>14} | {fmt(benchmarks['super_natural']):>14} | {fmt(benchmarks['unnatural']):>14} | {avg_str:>8}\")
 "
 }
 

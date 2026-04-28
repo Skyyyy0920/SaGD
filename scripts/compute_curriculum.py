@@ -70,9 +70,9 @@ def main():
             # projections = U[:, :k] * S[:k], shape (n, k)
             projections = data["projections"]
             eigenvalues = data["eigenvalues"]
-            S = np.sqrt(eigenvalues[:projections.shape[1]])
+            S = np.sqrt(np.maximum(eigenvalues[:projections.shape[1]], 1e-12))
             # Recover U: projections[:, k] = U[:, k] * S[k]
-            U = projections / S[np.newaxis, :]
+            U = projections / S[np.newaxis, :]  # safe: S clamped above
             indices = data["indices"]
         else:
             raise ValueError("pca_data.npz must contain 'projections' and 'eigenvalues'")

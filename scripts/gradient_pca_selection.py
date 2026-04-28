@@ -40,7 +40,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from sagd.data import InstructionDataset, SquadDataset, collate_fn
-from sagd.models import load_teacher, load_student
+from sagd.models import load_teacher
 
 
 # =============================================================================
@@ -108,28 +108,6 @@ class CountSketchProjector:
 #  Per-Sample Gradient Profiling
 # =============================================================================
 
-def compute_per_sample_kl(t_logits, s_logits, labels_mask, temperature=2.0):
-    """Compute per-sample KL divergence (scalar per sample, NOT batch-averaged).
-
-    Follows the same shift-alignment as trainer._compute_per_sample_kl().
-    Returns (B,) tensor.
-    """
-    t_shifted = t_logits[:, :-1, :]
-    s_shifted = s_logits[:, :-1, :]
-    mask = labels_mask[:, 1:].float()
-
-    t_probs = F.softmax(t_shifted / temperature, dim=-1)
-    t_log = torch.log(t_probs.clamp(min=1e-8))
-    s_log = F.log_softmax(s_shifted / temperature, dim=-1)
-
-    per_pos = (t_probs * (t_log - s_log)).sum(dim=-1)  # (B, L-1)
-    per_pos = per_pos * mask
-
-    mask_count = mask.sum(dim=-1).clamp(min=1)
-    per_sample = per_pos.sum(dim=-1) / mask_count
-    return per_sample * temperature ** 2  # (B,)
-
-
 def compute_teacher_nll(logits, input_ids, labels_mask):
     """Compute teacher's NLL (next-token prediction loss) on response tokens.
 
@@ -148,8 +126,7 @@ def compute_teacher_nll(logits, input_ids, labels_mask):
     return nll  # scalar
 
 
-def profile_gradients(teacher, student, dataloader, projector, device,
-                      temperature=2.0):
+def profile_gradients(teacher, dataloader, projector, device):
     """Compute projected per-sample TEACHER gradient for all training samples.
 
     Uses the teacher's NLL gradient to determine data structure —
@@ -359,8 +336,6 @@ def parse_args():
     # --- profile ---
     p = sub.add_parser("profile", help="Compute projected gradients and run PCA")
     p.add_argument("--teacher_model", type=str, default="Qwen/Qwen3-8B")
-    p.add_argument("--student_model", type=str, default="Qwen/Qwen3-0.6B")
-    p.add_argument("--student_ckpt", type=str, default=None)
     p.add_argument("--dataset", type=str, default="dolly", choices=["dolly", "squad"])
     p.add_argument("--output_dir", type=str, default="outputs/gradient_pca")
     p.add_argument("--max_samples", type=int, default=None)
@@ -424,16 +399,20 @@ def cmd_profile(args):
     )
 
     # --- Setup projector on teacher's profiled params ---
+    # Store hash tables on CPU to avoid GPU OOM (teacher attention params ~1.5B,
+    # hash tables ~18GB in int64+float32, doesn't fit alongside 8B teacher on GPU).
+    # Projection runs on CPU — slower but safe.
     print(f"Projection dimension: {args.proj_dim}")
+    print(f"Hash tables on CPU (teacher params too large for GPU hash tables)")
 
     projector = CountSketchProjector(
-        profiled_params, args.proj_dim, seed=args.seed, device=args.device
+        profiled_params, args.proj_dim, seed=args.seed, device="cpu"
     )
 
     # --- Profile using teacher gradients ---
     t0 = time.time()
     projected_grads, losses, indices = profile_gradients(
-        teacher, None, dataloader, projector, args.device, args.temperature
+        teacher, dataloader, projector, args.device
     )
     elapsed = time.time() - t0
     print(f"\nProfiling done in {elapsed:.1f}s ({elapsed/len(dataset):.3f}s/sample)")

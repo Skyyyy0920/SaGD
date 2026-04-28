@@ -410,14 +410,19 @@ class Trainer:
         global_step = 0
 
         for epoch in range(self.epochs):
-            # Per-epoch data subset selection (curriculum or DA-KD)
-            if curriculum_stages is not None and epoch < len(curriculum_stages):
-                # Curriculum: use the stage-specific subset for this epoch
-                stage_indices = curriculum_stages[epoch]
-                curriculum_subset = Subset(self.dataset, stage_indices)
+            # Per-epoch data ordering or subset selection
+            if curriculum_stages is not None:
+                # PC-Guided Curriculum: train ALL samples every epoch,
+                # but ordered by structural score (high-score first).
+                # curriculum_stages is a list of dataset indices sorted by score.
+                ordered_sampler = torch.utils.data.SequentialSampler(
+                    Subset(self.dataset, curriculum_stages)
+                )
                 epoch_dataloader = DataLoader(
-                    curriculum_subset, batch_size=self.batch_size,
-                    shuffle=True, collate_fn=collate_fn, drop_last=True,
+                    Subset(self.dataset, curriculum_stages),
+                    batch_size=self.batch_size,
+                    sampler=ordered_sampler,
+                    collate_fn=collate_fn, drop_last=True,
                 )
             elif self.method == "dakd" and epoch > 0:
                 subset = self._compute_dakd_subset(epoch)

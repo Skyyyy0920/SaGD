@@ -197,28 +197,10 @@ def main() -> None:
         curriculum_data = torch.load(args.curriculum_path, map_location="cpu",
                                      weights_only=False)
         sorted_indices = curriculum_data["sorted_indices"].tolist()
-        schedule = [float(x) for x in args.curriculum_schedule.split(",")]
-        n_total = len(sorted_indices)
-
-        # Build per-epoch subset indices
-        # Split epochs evenly across stages
-        epochs_per_stage = max(1, args.epochs // len(schedule))
-        curriculum_stages = []
-        for s, frac in enumerate(schedule):
-            k = int(n_total * frac)
-            stage_indices = sorted_indices[:k]
-            n_epochs = epochs_per_stage if s < len(schedule) - 1 else (
-                args.epochs - s * epochs_per_stage)
-            for _ in range(n_epochs):
-                curriculum_stages.append(stage_indices)
-        # Pad or truncate to exactly args.epochs
-        curriculum_stages = curriculum_stages[:args.epochs]
-        while len(curriculum_stages) < args.epochs:
-            curriculum_stages.append(sorted_indices)
-
-        for e, stage in enumerate(curriculum_stages):
-            print(f"  Epoch {e+1}: {len(stage)}/{n_total} samples "
-                  f"({len(stage)/n_total*100:.0f}%)")
+        # Pass the full sorted index list — every epoch trains ALL samples,
+        # but in this fixed order (high structural score first).
+        curriculum_stages = sorted_indices
+        print(f"  Curriculum: {len(sorted_indices)} samples, ordered by PC score")
 
     # Config dict
     config = {

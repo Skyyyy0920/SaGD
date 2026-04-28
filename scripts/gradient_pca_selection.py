@@ -11,11 +11,9 @@ Theory:
   - Coreset guarantee: subset gradient ≈ full-data gradient
 
 Usage:
-    # Step 1: Profile gradient structure
+    # Step 1: Profile gradient structure (using teacher's NLL gradient)
     python scripts/gradient_pca_selection.py profile \
         --teacher_model Qwen/Qwen3-8B \
-        --student_model Qwen/Qwen3-0.6B \
-        --student_ckpt outputs_dolly/qwen3_0.6B/standard_kd/seed_42/student_final.pt \
         --dataset dolly \
         --output_dir outputs/gradient_pca \
         --device cuda:0
@@ -132,50 +130,64 @@ def compute_per_sample_kl(t_logits, s_logits, labels_mask, temperature=2.0):
     return per_sample * temperature ** 2  # (B,)
 
 
+def compute_teacher_nll(logits, input_ids, labels_mask):
+    """Compute teacher's NLL (next-token prediction loss) on response tokens.
+
+    Returns scalar loss for a single sample.
+    """
+    shifted_logits = logits[:, :-1, :]  # (1, L-1, V)
+    shifted_targets = input_ids[:, 1:]   # (1, L-1)
+    mask = labels_mask[:, 1:].float()    # (1, L-1)
+
+    log_probs = F.log_softmax(shifted_logits, dim=-1)  # (1, L-1, V)
+    token_log_probs = log_probs.gather(
+        dim=-1, index=shifted_targets.unsqueeze(-1)
+    ).squeeze(-1)  # (1, L-1)
+
+    nll = -(token_log_probs * mask).sum() / mask.sum().clamp(min=1)
+    return nll  # scalar
+
+
 def profile_gradients(teacher, student, dataloader, projector, device,
                       temperature=2.0):
-    """Compute projected per-sample gradient for all training samples.
+    """Compute projected per-sample TEACHER gradient for all training samples.
+
+    Uses the teacher's NLL gradient to determine data structure —
+    the teacher (as the expert) identifies which samples activate
+    the most important learning directions.
 
     Uses batch_size=1 internally for per-sample gradient isolation.
 
     Returns:
         projected_grads: np.ndarray (n_samples, proj_dim)
-        losses: np.ndarray (n_samples,) — per-sample KL loss
+        losses: np.ndarray (n_samples,) — per-sample teacher NLL
         indices: np.ndarray (n_samples,) — dataset indices
     """
     teacher.eval()
-    student.eval()  # eval mode for deterministic gradients (no dropout)
 
     all_proj = []
     all_loss = []
     all_idx = []
 
-    for batch in tqdm(dataloader, desc="Gradient profiling"):
+    for batch in tqdm(dataloader, desc="Gradient profiling (teacher)"):
         input_ids = batch["input_ids"].to(device)       # (1, L)
         attention_mask = batch["attention_mask"].to(device)
         labels_mask = batch["labels_mask"].to(device)
         idx = batch["index"]
 
-        # Teacher forward (no grad)
-        with torch.no_grad():
-            t_out = teacher(input_ids=input_ids, attention_mask=attention_mask)
-            t_logits = t_out.logits.float()  # (1, L, V), cast to float32
+        # Teacher forward WITH grad (for gradient profiling)
+        teacher.zero_grad()
+        t_out = teacher(input_ids=input_ids, attention_mask=attention_mask)
+        t_logits = t_out.logits.float()  # (1, L, V)
 
-        # Student forward (with grad for backward)
-        student.zero_grad()
-        s_out = student(input_ids=input_ids, attention_mask=attention_mask)
-        s_logits = s_out.logits  # (1, L, V)
+        # Teacher NLL loss on response tokens
+        loss = compute_teacher_nll(t_logits, input_ids, labels_mask)
 
-        # Per-sample KL loss (scalar)
-        loss = compute_per_sample_kl(
-            t_logits, s_logits, labels_mask, temperature
-        ).squeeze(0)  # scalar
-
-        # Backward
+        # Backward through teacher
         loss.backward()
 
-        # Project gradient via Count Sketch
-        proj = projector.project(student)  # (proj_dim,)
+        # Project teacher gradient via Count Sketch
+        proj = projector.project(teacher)  # (proj_dim,)
 
         all_proj.append(proj.numpy())
         all_loss.append(loss.item())
@@ -374,17 +386,22 @@ def cmd_profile(args):
 
     # --- Load models ---
     print(f"Loading teacher: {args.teacher_model}")
-    teacher, _ = load_teacher(args.teacher_model, args.device)
+    teacher, tokenizer = load_teacher(args.teacher_model, args.device)
 
-    print(f"Loading student: {args.student_model}")
-    student, tokenizer = load_student(args.student_model, device="cpu")
-    if args.student_ckpt:
-        print(f"Loading checkpoint: {args.student_ckpt}")
-        state_dict = torch.load(args.student_ckpt, map_location="cpu",
-                                weights_only=True)
-        student.load_state_dict(state_dict)
-    student = student.to(args.device)
-    # Keep requires_grad=True — we need gradients for profiling
+    # Enable gradients on teacher attention layers for gradient profiling.
+    # We only profile a subset of teacher params to keep memory feasible:
+    # attention Q/K/V/O projections capture the main processing patterns.
+    profiled_params = {}
+    for name, p in teacher.named_parameters():
+        # Match attention projection layers (q_proj, k_proj, v_proj, o_proj)
+        if any(k in name for k in ['q_proj', 'k_proj', 'v_proj', 'o_proj']):
+            p.requires_grad_(True)
+            profiled_params[name] = p.numel()
+        # Keep other params frozen (no grad)
+
+    total_profiled = sum(profiled_params.values())
+    print(f"Teacher profiled parameters (attention only): {total_profiled:,} "
+          f"/ {sum(p.numel() for p in teacher.parameters()):,}")
 
     # --- Load data ---
     print(f"Loading dataset: {args.dataset}")
@@ -406,24 +423,17 @@ def cmd_profile(args):
         collate_fn=collate_fn, num_workers=0
     )
 
-    # --- Setup projector ---
-    param_shapes = {
-        name: p.numel()
-        for name, p in student.named_parameters()
-        if p.requires_grad
-    }
-    total_params = sum(param_shapes.values())
-    print(f"Total trainable parameters: {total_params:,}")
+    # --- Setup projector on teacher's profiled params ---
     print(f"Projection dimension: {args.proj_dim}")
 
     projector = CountSketchProjector(
-        param_shapes, args.proj_dim, seed=args.seed, device=args.device
+        profiled_params, args.proj_dim, seed=args.seed, device=args.device
     )
 
-    # --- Profile ---
+    # --- Profile using teacher gradients ---
     t0 = time.time()
     projected_grads, losses, indices = profile_gradients(
-        teacher, student, dataloader, projector, args.device, args.temperature
+        teacher, None, dataloader, projector, args.device, args.temperature
     )
     elapsed = time.time() - t0
     print(f"\nProfiling done in {elapsed:.1f}s ({elapsed/len(dataset):.3f}s/sample)")

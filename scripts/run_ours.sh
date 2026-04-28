@@ -126,6 +126,26 @@ run_prereq() {
             --output_path "$GRAD_ORDER" --top_r 50 --is_gradient
     fi
 
+    # 1e. POCL baseline: easy-first curriculum (sorted by loss ascending)
+    POCL_ORDER="${CURRICULUM_DIR}/pocl_order.pt"
+    if [ -f "$POCL_ORDER" ]; then
+        echo "[PREREQ] POCL curriculum order exists: $POCL_ORDER"
+    else
+        echo "[PREREQ] Computing POCL curriculum order (easy-first by loss)..."
+        python -c "
+import torch, numpy as np
+data = np.load('${GRAD_PCA_DIR}/gradient_profile.npz')
+losses, indices = data['losses'], data['indices']
+order = indices[np.argsort(losses)]  # ascending = easy first
+scores = np.sort(losses)
+torch.save({'sorted_indices': torch.tensor(order, dtype=torch.long),
+            'scores': torch.tensor(scores, dtype=torch.float32),
+            'metadata': {'source': 'pocl_easy_first', 'n_samples': len(order)}},
+           '${POCL_ORDER}')
+print(f'Saved POCL order: {len(order)} samples, loss range [{scores[0]:.4f}, {scores[-1]:.4f}]')
+"
+    fi
+
     echo "[PREREQ] All prerequisites ready."
 }
 
@@ -210,7 +230,36 @@ run_train() {
                 2>&1 | tee "${LOG_DIR}/train_kd_grad_cur_s${SEED}.log"
         fi
 
-        # E. SaGD ablation: noise-only (τ_w=100 ≈ uniform)
+        # E. POCL baseline: Standard KD + easy-first curriculum (loss-based ordering)
+        POCL_ORDER="${CURRICULUM_DIR}/pocl_order.pt"
+        CKPT="${OUTPUT_BASE}/kd_pocl/standard_kd/seed_${SEED}/student_final.pt"
+        if [ -f "$CKPT" ]; then
+            echo "[TRAIN] SKIP kd_pocl/seed_${SEED} (exists)"
+        else
+            echo "[TRAIN] >>> kd_pocl/seed_${SEED}"
+            python scripts/train.py \
+                --method standard_kd $COMMON_ARGS \
+                --curriculum_path "$POCL_ORDER" \
+                --seed $SEED \
+                --output_dir "${OUTPUT_BASE}/kd_pocl/" \
+                2>&1 | tee "${LOG_DIR}/train_kd_pocl_s${SEED}.log"
+        fi
+
+        # F. SaGD + POCL: SaGD loss + easy-first curriculum
+        CKPT="${OUTPUT_BASE}/sagd_pocl/sagd/seed_${SEED}/student_final.pt"
+        if [ -f "$CKPT" ]; then
+            echo "[TRAIN] SKIP sagd_pocl/seed_${SEED} (exists)"
+        else
+            echo "[TRAIN] >>> sagd_pocl/seed_${SEED}"
+            python scripts/train.py \
+                --method sagd $COMMON_ARGS $SAGD_ARGS \
+                --curriculum_path "$POCL_ORDER" \
+                --seed $SEED \
+                --output_dir "${OUTPUT_BASE}/sagd_pocl/" \
+                2>&1 | tee "${LOG_DIR}/train_sagd_pocl_s${SEED}.log"
+        fi
+
+        # G. SaGD ablation: noise-only (τ_w=100 ≈ uniform)
         CKPT="${OUTPUT_BASE}/sagd_noise_only/sagd/seed_${SEED}/student_final.pt"
         if [ -f "$CKPT" ]; then
             echo "[TRAIN] SKIP sagd_noise_only/seed_${SEED} (exists)"
@@ -262,11 +311,14 @@ run_eval() {
     METHOD_SUBDIR[sagd_sal_curriculum]="sagd"
     METHOD_SUBDIR[sagd_grad_curriculum]="sagd"
     METHOD_SUBDIR[kd_grad_curriculum]="standard_kd"
+    METHOD_SUBDIR[kd_pocl]="standard_kd"
+    METHOD_SUBDIR[sagd_pocl]="sagd"
     METHOD_SUBDIR[sagd_noise_only]="sagd"
     METHOD_SUBDIR[sagd_reweight_only]="sagd"
 
     for CONFIG in sagd_random sagd_sal_curriculum sagd_grad_curriculum \
-                  kd_grad_curriculum sagd_noise_only sagd_reweight_only; do
+                  kd_grad_curriculum kd_pocl sagd_pocl \
+                  sagd_noise_only sagd_reweight_only; do
         SUB="${METHOD_SUBDIR[$CONFIG]}"
         for SEED in "${SEEDS[@]}"; do
             CKPT="${OUTPUT_BASE}/${CONFIG}/${SUB}/seed_${SEED}/student_final.pt"
@@ -304,6 +356,8 @@ configs = {
     'sagd_sal_curriculum': 'sagd',
     'sagd_grad_curriculum': 'sagd',
     'kd_grad_curriculum': 'standard_kd',
+    'kd_pocl': 'standard_kd',
+    'sagd_pocl': 'sagd',
     'sagd_noise_only': 'sagd',
     'sagd_reweight_only': 'sagd',
 }

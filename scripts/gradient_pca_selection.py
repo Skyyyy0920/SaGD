@@ -98,7 +98,8 @@ class CountSketchProjector:
         for name, p in model.named_parameters():
             if p.grad is None or name not in self.hash_dims:
                 continue
-            grad_flat = p.grad.detach().view(-1).float()
+            # Move grad to same device as hash tables (CPU when profiling teacher)
+            grad_flat = p.grad.detach().to(self.device).view(-1).float()
             signed_grad = grad_flat * self.hash_signs[name]
             projected.scatter_add_(0, self.hash_dims[name], signed_grad)
         return projected.cpu()

@@ -37,9 +37,6 @@ NOISE_SIGMA=0.005
 SAGD_TAU_W=1.0
 SAGD_N=5
 
-# Curriculum schedule: 30% for first third of epochs, 60% for second, 100% for rest
-CURRICULUM_SCHEDULE="0.3,0.6,1.0"
-
 # Directories
 DATA_DIR="data"
 OUTPUT_BASE="outputs_ours/${STUDENT_TAG}/${DATASET}"
@@ -193,7 +190,7 @@ run_train() {
             python scripts/train.py \
                 --method sagd $COMMON_ARGS $SAGD_ARGS \
                 --curriculum_path "$SAL_ORDER" \
-                --curriculum_schedule "$CURRICULUM_SCHEDULE" \
+                \
                 --seed $SEED \
                 --output_dir "${OUTPUT_BASE}/sagd_sal_curriculum/" \
                 2>&1 | tee "${LOG_DIR}/train_sagd_sal_cur_s${SEED}.log"
@@ -208,7 +205,7 @@ run_train() {
             python scripts/train.py \
                 --method sagd $COMMON_ARGS $SAGD_ARGS \
                 --curriculum_path "$GRAD_ORDER" \
-                --curriculum_schedule "$CURRICULUM_SCHEDULE" \
+                \
                 --seed $SEED \
                 --output_dir "${OUTPUT_BASE}/sagd_grad_curriculum/" \
                 2>&1 | tee "${LOG_DIR}/train_sagd_grad_cur_s${SEED}.log"
@@ -223,7 +220,7 @@ run_train() {
             python scripts/train.py \
                 --method standard_kd $COMMON_ARGS \
                 --curriculum_path "$GRAD_ORDER" \
-                --curriculum_schedule "$CURRICULUM_SCHEDULE" \
+                \
                 --seed $SEED \
                 --output_dir "${OUTPUT_BASE}/kd_grad_curriculum/" \
                 2>&1 | tee "${LOG_DIR}/train_kd_grad_cur_s${SEED}.log"

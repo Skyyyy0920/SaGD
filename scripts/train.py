@@ -93,11 +93,7 @@ def parse_args() -> argparse.Namespace:
     # Curriculum
     p.add_argument("--curriculum_path", type=str, default=None,
                     help="Path to curriculum order file (.pt) from compute_curriculum.py. "
-                         "Enables staged curriculum: train on top samples first.")
-    p.add_argument("--curriculum_schedule", type=str, default="0.3,0.6,1.0",
-                    help="Comma-separated fractions for staged curriculum. "
-                         "E.g., '0.3,0.6,1.0' = 30%% for first stage, 60%% for second, "
-                         "100%% for remaining epochs. Stages are split evenly across epochs.")
+                         "Trains all samples every epoch, ordered by structural score.")
 
     # Output
     p.add_argument("--output_dir", type=str, default="outputs/")
@@ -219,7 +215,6 @@ def main() -> None:
         "log_every": args.log_every,
         "save_every_n_epochs": args.save_every_n_epochs,
         "curriculum_path": args.curriculum_path,
-        "curriculum_schedule": args.curriculum_schedule if args.curriculum_path else None,
         "teacher_saliency_path": args.teacher_saliency_path,
         "lambda_noise": args.lambda_noise,
         "noise_sigma": args.noise_sigma,

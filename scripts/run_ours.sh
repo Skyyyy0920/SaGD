@@ -98,7 +98,6 @@ run_prereq() {
         mkdir -p "$GRAD_PCA_DIR"
         python scripts/gradient_pca_selection.py profile \
             --teacher_model "$TEACHER" \
-            --student_model "$STUDENT" \
             --dataset "$DATASET" \
             --output_dir "$GRAD_PCA_DIR" \
             --device "$DEVICE" \

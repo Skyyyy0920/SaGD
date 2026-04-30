@@ -347,6 +347,14 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--select_ratio", type=float, default=0.5,
                    help="Fraction of data to select")
+    p.add_argument("--shard", type=str, default=None,
+                   help="Shard spec 'IDX/TOTAL' for parallel profiling, e.g. '0/3'")
+
+    # --- merge (combine shards) ---
+    m = sub.add_parser("merge", help="Merge sharded profile results")
+    m.add_argument("--output_dir", type=str, required=True)
+    m.add_argument("--num_shards", type=int, required=True)
+    m.add_argument("--select_ratio", type=float, default=0.5)
 
     # --- select (from saved profile) ---
     s = sub.add_parser("select", help="Select subset from saved profile")
@@ -393,6 +401,15 @@ def cmd_profile(args):
         )
     print(f"Dataset size: {len(dataset)}")
 
+    # Shard the dataset if running in parallel
+    if args.shard:
+        shard_idx, num_shards = [int(x) for x in args.shard.split("/")]
+        shard_size = len(dataset) // num_shards
+        start = shard_idx * shard_size
+        end = len(dataset) if shard_idx == num_shards - 1 else (shard_idx + 1) * shard_size
+        dataset = torch.utils.data.Subset(dataset, list(range(start, end)))
+        print(f"Shard {shard_idx}/{num_shards}: samples [{start}, {end}) = {len(dataset)}")
+
     # batch_size=1 for per-sample gradient isolation
     dataloader = DataLoader(
         dataset, batch_size=1, shuffle=False,
@@ -400,14 +417,12 @@ def cmd_profile(args):
     )
 
     # --- Setup projector on teacher's profiled params ---
-    # Store hash tables on CPU to avoid GPU OOM (teacher attention params ~1.5B,
-    # hash tables ~18GB in int64+float32, doesn't fit alongside 8B teacher on GPU).
-    # Projection runs on CPU — slower but safe.
+    # Hash tables on GPU for speed (~18GB for 1.5B params).
+    # Total GPU memory: teacher 16GB + hash 18GB + activations ~15GB ≈ 49GB, fits A100 80GB.
     print(f"Projection dimension: {args.proj_dim}")
-    print(f"Hash tables on CPU (teacher params too large for GPU hash tables)")
 
     projector = CountSketchProjector(
-        profiled_params, args.proj_dim, seed=args.seed, device="cpu"
+        profiled_params, args.proj_dim, seed=args.seed, device=args.device
     )
 
     # --- Profile using teacher gradients ---
@@ -419,12 +434,17 @@ def cmd_profile(args):
     print(f"\nProfiling done in {elapsed:.1f}s ({elapsed/len(dataset):.3f}s/sample)")
 
     # Save raw profile
+    suffix = f"_shard{args.shard.split('/')[0]}" if args.shard else ""
     np.savez(
-        os.path.join(args.output_dir, "gradient_profile.npz"),
+        os.path.join(args.output_dir, f"gradient_profile{suffix}.npz"),
         projected_grads=projected_grads,
         losses=losses,
         indices=indices,
     )
+
+    if args.shard:
+        print(f"Shard saved. Run 'merge' to combine all shards.")
+        return
 
     # --- Analyze and select ---
     analysis, selected_indices = analyze_and_select(
@@ -532,10 +552,49 @@ def cmd_select(args):
         json.dump(analysis, f, indent=2)
 
 
+def cmd_merge(args):
+    """Merge sharded profile results and run analysis."""
+    all_grads, all_losses, all_indices = [], [], []
+    for i in range(args.num_shards):
+        path = os.path.join(args.output_dir, f"gradient_profile_shard{i}.npz")
+        print(f"Loading shard {i}: {path}")
+        data = np.load(path)
+        all_grads.append(data["projected_grads"])
+        all_losses.append(data["losses"])
+        all_indices.append(data["indices"])
+
+    projected_grads = np.concatenate(all_grads, axis=0)
+    losses = np.concatenate(all_losses, axis=0)
+    indices = np.concatenate(all_indices, axis=0)
+
+    print(f"Merged: {len(indices)} samples")
+
+    # Save merged
+    np.savez(
+        os.path.join(args.output_dir, "gradient_profile.npz"),
+        projected_grads=projected_grads, losses=losses, indices=indices,
+    )
+
+    # Analyze
+    analysis, selected_indices = analyze_and_select(
+        projected_grads, losses, indices, select_ratio=args.select_ratio
+    )
+    with open(os.path.join(args.output_dir, "gradient_pca_analysis.json"), "w") as f:
+        json.dump(analysis, f, indent=2)
+
+    torch.save(
+        torch.tensor(selected_indices, dtype=torch.long),
+        os.path.join(args.output_dir, "selected_indices.pt")
+    )
+    print(f"Selected {len(selected_indices)} indices saved.")
+
+
 def main():
     args = parse_args()
     if args.command == "profile":
         cmd_profile(args)
+    elif args.command == "merge":
+        cmd_merge(args)
     elif args.command == "select":
         cmd_select(args)
     else:

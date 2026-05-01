@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+
+# Local-only artifacts (not for main repo)
+.claude/
+writing/
+refs/
+pca_analysis.json
+pca_analysis.png
+ChatGPT*.png
+
+# Training outputs and data caches
+outputs/
+outputs_*/
+data/teacher_saliency_*.pt
+logs/
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -114,12 +114,17 @@ def generate_responses(
             input_ids_batch = input_ids_batch.to(device)
             attention_mask_batch = attention_mask_batch.to(device)
 
+            # repetition_penalty + no_repeat_ngram_size prevent greedy
+            # mode-collapse on small KD students (LLaMA-3.2-1B in particular).
+            # Matches eval setup of DA-KD / DistiLLM / GKD reference implementations.
             gen_kwargs = dict(
                 input_ids=input_ids_batch,
                 attention_mask=attention_mask_batch,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 pad_token_id=pad_id,
+                repetition_penalty=1.1,
+                no_repeat_ngram_size=3,
             )
             if suppress_tokens is not None:
                 gen_kwargs["suppress_tokens"] = suppress_tokens

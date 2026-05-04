@@ -809,11 +809,16 @@ class EvalInstructionDataset(Dataset):
         soft length filter (>= 11 tokens) applied at the reference text.
         """
         # 1) MiniLLM curated (already filtered to len>=11)
-        # MiniLLM names this dataset "sinst" (S-NI abbrev). HF repo may be
-        # empty; fall back to MiniLLM github repo raw URL.
-        raw = _minillm_load("MiniLLM/sinst", ("valid.jsonl", "test.jsonl"))
+        # MiniLLM/sinst organizes data into length-bucket subfolders
+        # (0_2, 3_6, 6_10, 11_). The [11,+inf] subset is what MiniLLM uses
+        # for their main results in the paper (Section 3.2).
+        raw = _minillm_load(
+            "MiniLLM/sinst",
+            ("11_/valid.jsonl", "11_/test.jsonl", "valid.jsonl", "test.jsonl"),
+        )
         if raw is None:
             for path in (
+                "super-natural-instructions/11_/valid.jsonl",
                 "super-natural-instructions/test.jsonl",
                 "super-natural-instructions/valid.jsonl",
             ):
@@ -879,11 +884,15 @@ class EvalInstructionDataset(Dataset):
         drawn from the core set (matches DA-KD / DistiLLM / MiniLLM setup).
         Fallback: ``mrm8488/unnatural-instructions-full`` raw.
         """
-        # MiniLLM names this dataset "uinst" (U-NI abbrev). HF repo may be
-        # empty; fall back to MiniLLM github repo raw URL, then mrm8488 raw.
-        raw = _minillm_load("MiniLLM/uinst", ("valid.jsonl", "test.jsonl"))
+        # MiniLLM/uinst uses the same length-bucket subfolder layout as sinst.
+        # The [11,+inf] subset matches MiniLLM/DA-KD's main-result eval setup.
+        raw = _minillm_load(
+            "MiniLLM/uinst",
+            ("11_/valid.jsonl", "11_/test.jsonl", "valid.jsonl", "test.jsonl"),
+        )
         if raw is None:
             for path in (
+                "unnatural-instructions/11_/valid.jsonl",
                 "unnatural-instructions/test.jsonl",
                 "unnatural-instructions/valid.jsonl",
             ):

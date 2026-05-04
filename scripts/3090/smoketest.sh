@@ -15,7 +15,7 @@ python scripts/train.py \
     --method standard_kd --dataset dolly \
     --teacher_model meta-llama/Llama-3.1-8B-Instruct \
     --student_model meta-llama/Llama-3.2-1B-Instruct \
-    --load_8bit_teacher --gradient_checkpointing \
+    --load_8bit_teacher --gradient_checkpointing --use_8bit_optimizer \
     --epochs 1 --batch_size 1 --gradient_accumulation 8 \
     --max_train_samples 50 --skip_eval \
     --output_dir /tmp/smoke_3090/ --device cuda:0

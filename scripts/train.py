@@ -102,6 +102,8 @@ def parse_args() -> argparse.Namespace:
                     help="Load teacher with bitsandbytes int8 quantization (fits 24GB GPUs).")
     p.add_argument("--gradient_checkpointing", action="store_true",
                     help="Enable gradient checkpointing on student to reduce activation memory.")
+    p.add_argument("--use_8bit_optimizer", action="store_true",
+                    help="Use bitsandbytes AdamW8bit (saves ~75% optimizer state memory).")
     p.add_argument("--skip_eval", action="store_true")
     p.add_argument("--skip_bertscore", action="store_true",
                     help="Skip BERTScore in post-training eval")
@@ -222,6 +224,7 @@ def main() -> None:
         "max_grad_norm": args.max_grad_norm,
         "temperature": args.temperature,
         "fp16": args.fp16,
+        "use_8bit_optimizer": args.use_8bit_optimizer,
         "log_every": args.log_every,
         "save_every_n_epochs": args.save_every_n_epochs,
         "curriculum_path": args.curriculum_path,

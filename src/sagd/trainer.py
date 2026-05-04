@@ -99,6 +99,7 @@ class Trainer:
         self.max_grad_norm = config.get("max_grad_norm", 1.0)
         self.temperature = config.get("temperature", 2.0)
         self.fp16 = config.get("fp16", True)
+        self.use_8bit_optimizer = config.get("use_8bit_optimizer", False)
         self.log_every = config.get("log_every", 50)
         # save_every_n_epochs <= 0 means: only save the final checkpoint
         # (avoids filling disk with 10x intermediate checkpoints across 80 runs).
@@ -393,9 +394,19 @@ class Trainer:
             shuffle=True, collate_fn=collate_fn, drop_last=True,
         )
 
-        optimizer = torch.optim.AdamW(
-            self.student.parameters(), lr=self.lr, weight_decay=self.weight_decay,
-        )
+        # 8-bit AdamW from bitsandbytes saves ~75% optimizer-state memory
+        # (~10GB -> ~2.5GB for a 1B-param student), required to fit
+        # LLaMA-1B + 8-bit teacher on a 24GB GPU.
+        if getattr(self, "use_8bit_optimizer", False):
+            import bitsandbytes as bnb
+            optimizer = bnb.optim.AdamW8bit(
+                self.student.parameters(),
+                lr=self.lr, weight_decay=self.weight_decay,
+            )
+        else:
+            optimizer = torch.optim.AdamW(
+                self.student.parameters(), lr=self.lr, weight_decay=self.weight_decay,
+            )
 
         total_steps = len(dataloader) * self.epochs
         warmup_steps = int(total_steps * self.warmup_ratio)

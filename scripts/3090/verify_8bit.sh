@@ -29,7 +29,7 @@ if [ ! -f "$CKPT" ]; then
     python scripts/train.py \
         --method standard_kd --dataset dolly \
         --teacher_model "$TEACHER" --student_model "$STUDENT" \
-        --load_8bit_teacher --gradient_checkpointing \
+        --load_8bit_teacher --gradient_checkpointing --use_8bit_optimizer \
         --epochs "$EPOCHS" --batch_size 1 --gradient_accumulation 32 \
         --lr 1e-5 --max_seq_len 512 --skip_eval \
         --seed "$SEED" --output_dir "$OUT" --device cuda:0

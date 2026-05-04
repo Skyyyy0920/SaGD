@@ -85,31 +85,50 @@ class InstructionDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
 
-        raw = load_dataset(dataset_name, split=split)
-        raw = raw.shuffle(seed=seed)
+        raw = None
+        # Primary source: MiniLLM-curated Dolly split (matches DA-KD / DistiLLM
+        # / MiniLLM setup). Has built-in train/valid/test splits with their own
+        # filtering and prompt re-formatting. Falls back to raw Dolly + self-
+        # split if MiniLLM dataset is unavailable.
+        if dataset_name in ("databricks/databricks-dolly-15k", "MiniLLM/dolly", None):
+            hf_split = {"train": "train", "val": "valid", "test": "test"}.get(subset)
+            for name in ["MiniLLM/dolly"]:
+                try:
+                    raw = load_dataset(name, split=hf_split, trust_remote_code=True)
+                    break
+                except Exception:
+                    continue
 
-        # Split into train / val / test
-        n_total = len(raw)
-        n_test = 500
-        n_val = 500
-        n_train = n_total - n_test - n_val
-
-        if subset == "train":
-            raw = raw.select(range(n_train))
-        elif subset == "val":
-            raw = raw.select(range(n_train, n_train + n_val))
-        elif subset == "test":
-            raw = raw.select(range(n_train + n_val, n_total))
-        else:
-            raise ValueError(f"Unknown subset: {subset}. Must be train/val/test")
+        if raw is None:
+            # Fallback: self-split from raw Dolly
+            raw = load_dataset(dataset_name, split=split)
+            raw = raw.shuffle(seed=seed)
+            n_total = len(raw)
+            n_test = 500
+            n_val = 500
+            n_train = n_total - n_test - n_val
+            if subset == "train":
+                raw = raw.select(range(n_train))
+            elif subset == "val":
+                raw = raw.select(range(n_train, n_train + n_val))
+            elif subset == "test":
+                raw = raw.select(range(n_train + n_val, n_total))
+            else:
+                raise ValueError(f"Unknown subset: {subset}. Must be train/val/test")
 
         if max_samples is not None:
             raw = raw.select(range(min(max_samples, len(raw))))
 
         self.samples: list[dict[str, Any]] = []
         for i, row in enumerate(raw):
-            prompt_str = _format_prompt(row["instruction"], row.get("context", ""))
-            full_str = prompt_str + row["response"]
+            # Schema varies:
+            #   raw Dolly:     {instruction, context, response, category}
+            #   MiniLLM/dolly: {prompt, input, output}  (pre-formatted)
+            instruction = row.get("instruction") or row.get("prompt") or ""
+            context = row.get("context") or row.get("input") or ""
+            response = row.get("response") or row.get("output") or row.get("answer") or ""
+            prompt_str = _format_prompt(instruction, context)
+            full_str = prompt_str + response
 
             prompt_enc = tokenizer(
                 prompt_str, add_special_tokens=True, truncation=True,
@@ -134,8 +153,8 @@ class InstructionDataset(Dataset):
                 "labels_mask": labels_mask,
                 "index": i,
                 "category": row.get("category", "unknown"),
-                "instruction": row["instruction"],
-                "response": row["response"],
+                "instruction": instruction,
+                "response": response,
             })
 
     def __len__(self) -> int:
@@ -656,65 +675,122 @@ class EvalInstructionDataset(Dataset):
         }
 
     def _load_dolly_eval(self, tokenizer, max_seq_len, max_samples, seed):
-        """Dolly eval: last 500 of the Dolly-15K dataset (test split)."""
-        raw = load_dataset("databricks/databricks-dolly-15k", split="train")
-        raw = raw.shuffle(seed=seed)
-        n_total = len(raw)
-        raw = raw.select(range(n_total - 500, n_total))  # last 500 = test
-        limit = max_samples if max_samples is not None else 500
-        raw = raw.select(range(min(limit, len(raw))))
-        for i, row in enumerate(raw):
-            self.samples.append(self._tokenize_sample(
-                tokenizer, row["instruction"], row.get("context", ""),
-                row["response"], max_seq_len, i,
-            ))
-
-    def _load_self_inst(self, tokenizer, max_seq_len, max_samples, seed):
-        """Self-Instruct human evaluation set (252 samples, used by DA-KD).
-
-        Primary: ``yizhongw/self_instruct`` human_eval config.
-        This dataset's loading script is deprecated on newer ``datasets``
-        versions, so fall back gracefully.
-        """
-        loaded = False
-        for name, config in [
-            ("yizhongw/self_instruct", "human_eval"),
-            ("yizhongw/self_instruct", "self_instruct"),
-        ]:
+        """Dolly eval — prefer MiniLLM curated 500-sample test split (matches
+        DA-KD / DistiLLM / MiniLLM setup). Fallback: self-split last 500 of
+        raw Dolly-15K."""
+        raw = None
+        for name in ["MiniLLM/dolly"]:
             try:
-                raw = load_dataset(name, config, split="train", trust_remote_code=True)
-                loaded = True
+                raw = load_dataset(name, split="test", trust_remote_code=True)
                 break
             except Exception:
                 continue
+        if raw is None:
+            raw = load_dataset("databricks/databricks-dolly-15k", split="train")
+            raw = raw.shuffle(seed=seed)
+            n_total = len(raw)
+            raw = raw.select(range(n_total - 500, n_total))
+        limit = max_samples if max_samples is not None else 500
+        raw = raw.select(range(min(limit, len(raw))))
+        for i, row in enumerate(raw):
+            instruction = row.get("instruction") or row.get("prompt") or ""
+            context = row.get("context") or row.get("input") or ""
+            response = row.get("response") or row.get("output") or row.get("answer") or ""
+            self.samples.append(self._tokenize_sample(
+                tokenizer, instruction, context, response, max_seq_len, i,
+            ))
 
-        if not loaded:
+    def _load_self_inst(self, tokenizer, max_seq_len, max_samples, seed):
+        """Self-Instruct evaluation set (252 samples, used by DA-KD/DistiLLM).
+
+        Primary: ``MiniLLM/self-inst`` (curated 252-sample test split).
+        Fallback: ``yizhongw/self_instruct`` human_eval / self_instruct config.
+        """
+        raw = None
+        # MiniLLM curated split first
+        for name in ["MiniLLM/self-inst", "MiniLLM/self_inst"]:
+            try:
+                raw = load_dataset(name, split="test", trust_remote_code=True)
+                break
+            except Exception:
+                continue
+        # Fallback: original yizhongw repo
+        if raw is None:
+            for name, config in [
+                ("yizhongw/self_instruct", "human_eval"),
+                ("yizhongw/self_instruct", "self_instruct"),
+            ]:
+                try:
+                    raw = load_dataset(name, config, split="train", trust_remote_code=True)
+                    break
+                except Exception:
+                    continue
+
+        if raw is None:
             print("WARNING: Could not load Self-Instruct from any known source. Skipping.")
             return
 
-        raw = raw.shuffle(seed=seed)
+        if hasattr(raw, "shuffle"):
+            raw = raw.shuffle(seed=seed)
         limit = max_samples if max_samples is not None else 252
         raw = raw.select(range(min(limit, len(raw))))
         for i, row in enumerate(raw):
-            # Schema varies by config: try human_eval format first, then fallback
-            instruction = row.get("instruction", row.get("prompt", ""))
+            # Schema varies:
+            #   MiniLLM/self-inst:    {prompt, output}
+            #   yizhongw human_eval:  {instruction, instances:[{input,output}]}
+            instruction = row.get("instruction") or row.get("prompt") or ""
             instances = row.get("instances", [])
             if instances and len(instances) > 0:
                 inp = instances[0].get("input", "") or ""
                 out = instances[0].get("output", "") or ""
             else:
-                inp = ""
-                out = row.get("completion", "")
+                inp = row.get("input", "") or ""
+                out = (row.get("output") or row.get("response")
+                       or row.get("answer") or row.get("completion") or "")
             self.samples.append(self._tokenize_sample(
                 tokenizer, instruction, inp, out, max_seq_len, i,
             ))
 
     def _load_super_natural(self, tokenizer, max_seq_len, max_samples, seed):
-        """Super-Natural Instructions test set (streaming, capped at 500).
+        """Super-Natural Instructions test set.
 
-        Primary: ``Muennighoff/natural-instructions`` (renamed from
-        ``Muennighoff/super_natural_instructions``).
+        Primary: ``MiniLLM/super-natural-instructions`` — 9K samples
+        pre-filtered to ground-truth response length >= 11 tokens
+        (matches DA-KD / DistiLLM / MiniLLM setup; raw HF version
+        contains many short ``Yes./No.`` references which collapse ROUGE).
+
+        Fallback: ``Muennighoff/natural-instructions`` raw, with our own
+        soft length filter (>= 11 tokens) applied at the reference text.
         """
+        raw = None
+        # 1) MiniLLM curated (already filtered)
+        for name in [
+            "MiniLLM/super-natural-instructions",
+            "MiniLLM/super_natural_instructions",
+        ]:
+            try:
+                raw = load_dataset(name, split="test", trust_remote_code=True)
+                break
+            except Exception:
+                continue
+
+        if raw is not None:
+            limit = max_samples if max_samples is not None else 500
+            raw = raw.select(range(min(limit, len(raw))))
+            for i, row in enumerate(raw):
+                instruction = (row.get("definition") or row.get("instruction")
+                               or row.get("prompt") or "")
+                inp = row.get("inputs") or row.get("input") or ""
+                out = (row.get("targets") or row.get("output")
+                       or row.get("response") or row.get("answer") or "")
+                if isinstance(out, list):
+                    out = out[0] if out else ""
+                self.samples.append(self._tokenize_sample(
+                    tokenizer, instruction, inp, out, max_seq_len, i,
+                ))
+            return
+
+        # 2) Fallback: raw Muennighoff with our own length>=11 filter
         loaded = False
         for name in [
             "Muennighoff/natural-instructions",
@@ -726,7 +802,6 @@ class EvalInstructionDataset(Dataset):
                 break
             except Exception:
                 continue
-
         if not loaded:
             print("WARNING: Could not load Super-Natural Instructions. Skipping.")
             return
@@ -739,9 +814,11 @@ class EvalInstructionDataset(Dataset):
             instruction = row.get("definition", "")
             inp = row.get("inputs", "")
             targets = row.get("targets", "")
-            # targets can be a list of strings
             if isinstance(targets, list):
                 targets = targets[0] if targets else ""
+            # MiniLLM-style length filter: only include refs with >=11 word tokens
+            if len(str(targets).split()) < 11:
+                continue
             samples.append((instruction, inp, targets))
         for i, (inst, inp, resp) in enumerate(samples):
             self.samples.append(self._tokenize_sample(
@@ -749,18 +826,33 @@ class EvalInstructionDataset(Dataset):
             ))
 
     def _load_unnatural(self, tokenizer, max_seq_len, max_samples, seed):
-        """Unnatural Instructions (capped at 500 for eval).
+        """Unnatural Instructions evaluation set.
 
-        The ``instances`` field is a list of dicts, each with
-        ``input``, ``output``, and ``constraints`` keys.
+        Primary: ``MiniLLM/unnatural-instructions`` — 10K samples randomly
+        drawn from the core set (matches DA-KD / DistiLLM / MiniLLM setup).
+        Fallback: ``mrm8488/unnatural-instructions-full`` raw.
         """
-        raw = load_dataset("mrm8488/unnatural-instructions-full", split="train")
-        raw = raw.shuffle(seed=seed)
+        raw = None
+        for name in [
+            "MiniLLM/unnatural-instructions",
+            "MiniLLM/unnatural_instructions",
+        ]:
+            try:
+                raw = load_dataset(name, split="test", trust_remote_code=True)
+                break
+            except Exception:
+                continue
+
+        if raw is None:
+            raw = load_dataset("mrm8488/unnatural-instructions-full", split="train")
+            raw = raw.shuffle(seed=seed)
+
         limit = max_samples if max_samples is not None else 500
         raw = raw.select(range(min(limit, len(raw))))
         for i, row in enumerate(raw):
-            inst = row.get("instruction", "")
-            # instances is a list of dicts with input/output
+            inst = (row.get("instruction") or row.get("prompt")
+                    or row.get("definition") or "")
+            # raw mrm8488 nests in "instances": [{input, output, ...}]
             instances = row.get("instances", [])
             if isinstance(instances, str):
                 import json as _json
@@ -772,8 +864,11 @@ class EvalInstructionDataset(Dataset):
                 inp = instances[0].get("input", "") or ""
                 out = instances[0].get("output", "") or ""
             else:
-                inp = row.get("input", "")
-                out = row.get("output", "")
+                inp = row.get("input", "") or ""
+                out = (row.get("output") or row.get("response")
+                       or row.get("answer") or row.get("targets") or "")
+                if isinstance(out, list):
+                    out = out[0] if out else ""
             self.samples.append(self._tokenize_sample(
                 tokenizer, inst, inp, out, max_seq_len, i,
             ))
@@ -787,8 +882,9 @@ class EvalInstructionDataset(Dataset):
         """
         loaded = False
         candidates = [
-            ("MiniLLM/vicuna-eval-80", None, "test"),
             ("MiniLLM/vicuna-eval", None, "test"),
+            ("MiniLLM/vicuna_eval", None, "test"),
+            ("MiniLLM/vicuna-eval-80", None, "test"),
             ("lmsys/vicuna_eval", None, "train"),
             ("MBZUAI/vicuna-eval", None, "train"),
         ]

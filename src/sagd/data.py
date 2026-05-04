@@ -25,22 +25,46 @@ from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
 
 
-def _minillm_load(repo_id: str, split_file: str = "test.jsonl"):
+def _minillm_load(repo_id: str, split_files=("valid.jsonl", "test.jsonl")):
     """Load a single JSONL split from a MiniLLM HF dataset, bypassing the
     cross-split cast that ``load_dataset(repo_id, split=...)`` performs.
 
-    MiniLLM datasets (``MiniLLM/dolly``, ``MiniLLM/self-inst`` etc.) ship
-    train/valid/test JSONLs whose columns may differ across splits, which
-    causes ``DatasetGenerationCastError`` when datasets >= 3.0 tries to
-    auto-cast. Loading a single jsonl via the raw resolve URL avoids that.
+    MiniLLM HF datasets ship multiple JSONLs (e.g. ``raw.jsonl`` + ``valid.jsonl``
+    or just ``valid.jsonl``). The standard ``load_dataset(repo_id, split=...)``
+    auto-casts columns across files which fails when schemas differ. Loading
+    a single jsonl via raw resolve URL avoids the cast.
 
     Args:
         repo_id: HF dataset repo, e.g. ``"MiniLLM/dolly"``.
-        split_file: filename within the repo, e.g. ``"test.jsonl"``.
+        split_files: filenames to try in order. Default tries ``valid.jsonl``
+            first (MiniLLM uses this name for held-out eval split) then
+            ``test.jsonl`` as a fallback. Pass a single str for one filename.
 
-    Returns the loaded dataset, or ``None`` on any failure (caller falls back).
+    Returns the loaded dataset (split="train" of the json loader), or ``None``.
     """
-    url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{split_file}"
+    if isinstance(split_files, str):
+        split_files = (split_files,)
+    for fname in split_files:
+        url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{fname}"
+        try:
+            return load_dataset("json", data_files=url, split="train")
+        except Exception:
+            continue
+    return None
+
+
+def _github_jsonl_load(github_path: str):
+    """Load a jsonl file directly from MiniLLM's github repo (fallback when
+    the HF dataset is empty/unavailable).
+
+    Args:
+        github_path: relative path under microsoft/LMOps/minillm/data/, e.g.
+            ``"super-natural-instructions/test.jsonl"``.
+    """
+    url = (
+        f"https://raw.githubusercontent.com/microsoft/LMOps/main/minillm/data/"
+        f"{github_path}"
+    )
     try:
         return load_dataset("json", data_files=url, split="train")
     except Exception:
@@ -108,14 +132,30 @@ class InstructionDataset(Dataset):
         self.max_seq_len = max_seq_len
 
         raw = None
-        # Primary source: MiniLLM-curated Dolly split (matches DA-KD / DistiLLM
-        # / MiniLLM setup). Loads single jsonl via URL to avoid cross-split
-        # column-cast errors. Falls back to raw Dolly + self-split below.
+        # Primary source: MiniLLM-curated Dolly (matches DA-KD / DistiLLM /
+        # MiniLLM setup). MiniLLM/dolly publishes:
+        #   raw.jsonl   — full 15K Dolly samples (used for training)
+        #   valid.jsonl — 500 held-out samples (used for DollyEval)
+        # No separate train.jsonl: training data = raw.jsonl - valid.jsonl
+        # (filter by prompt to avoid leakage of eval samples into training).
         if dataset_name in ("databricks/databricks-dolly-15k", "MiniLLM/dolly", None):
-            split_file = {"train": "train.jsonl", "val": "valid.jsonl",
-                           "test": "test.jsonl"}.get(subset)
-            if split_file is not None:
-                raw = _minillm_load("MiniLLM/dolly", split_file)
+            if subset == "train":
+                raw_full = _minillm_load("MiniLLM/dolly", ("raw.jsonl",))
+                valid = _minillm_load("MiniLLM/dolly", ("valid.jsonl", "test.jsonl"))
+                if raw_full is not None and valid is not None:
+                    valid_keys = {
+                        (r.get("prompt") or r.get("instruction") or "")
+                        for r in valid
+                    }
+                    raw = raw_full.filter(
+                        lambda r: (r.get("prompt") or r.get("instruction") or "")
+                                   not in valid_keys
+                    )
+                elif raw_full is not None:
+                    raw = raw_full
+            elif subset in ("val", "test"):
+                # Both val and test resolve to MiniLLM's held-out 500 samples
+                raw = _minillm_load("MiniLLM/dolly", ("valid.jsonl", "test.jsonl"))
 
         if raw is None:
             # Fallback: self-split from raw Dolly
@@ -696,7 +736,8 @@ class EvalInstructionDataset(Dataset):
         """Dolly eval — prefer MiniLLM curated 500-sample test split (matches
         DA-KD / DistiLLM / MiniLLM setup). Fallback: self-split last 500 of
         raw Dolly-15K."""
-        raw = _minillm_load("MiniLLM/dolly", "test.jsonl")
+        # MiniLLM publishes the eval split as valid.jsonl (500 samples).
+        raw = _minillm_load("MiniLLM/dolly", ("valid.jsonl", "test.jsonl"))
         if raw is None:
             raw = load_dataset("databricks/databricks-dolly-15k", split="train")
             raw = raw.shuffle(seed=seed)
@@ -718,7 +759,7 @@ class EvalInstructionDataset(Dataset):
         Primary: ``MiniLLM/self-inst`` (curated 252-sample test split).
         Fallback: ``yizhongw/self_instruct`` human_eval / self_instruct config.
         """
-        raw = _minillm_load("MiniLLM/self-inst", "test.jsonl")
+        raw = _minillm_load("MiniLLM/self-inst", ("valid.jsonl", "test.jsonl"))
         # Fallback: original yizhongw repo
         if raw is None:
             for name, config in [
@@ -768,8 +809,17 @@ class EvalInstructionDataset(Dataset):
         soft length filter (>= 11 tokens) applied at the reference text.
         """
         # 1) MiniLLM curated (already filtered to len>=11)
-        # MiniLLM names this dataset "sinst" (Super-Natural Instructions abbrev).
-        raw = _minillm_load("MiniLLM/sinst", "test.jsonl")
+        # MiniLLM names this dataset "sinst" (S-NI abbrev). HF repo may be
+        # empty; fall back to MiniLLM github repo raw URL.
+        raw = _minillm_load("MiniLLM/sinst", ("valid.jsonl", "test.jsonl"))
+        if raw is None:
+            for path in (
+                "super-natural-instructions/test.jsonl",
+                "super-natural-instructions/valid.jsonl",
+            ):
+                raw = _github_jsonl_load(path)
+                if raw is not None:
+                    break
 
         if raw is not None:
             limit = max_samples if max_samples is not None else 500
@@ -829,8 +879,17 @@ class EvalInstructionDataset(Dataset):
         drawn from the core set (matches DA-KD / DistiLLM / MiniLLM setup).
         Fallback: ``mrm8488/unnatural-instructions-full`` raw.
         """
-        # MiniLLM names this dataset "uinst" (Unnatural Instructions abbrev).
-        raw = _minillm_load("MiniLLM/uinst", "test.jsonl")
+        # MiniLLM names this dataset "uinst" (U-NI abbrev). HF repo may be
+        # empty; fall back to MiniLLM github repo raw URL, then mrm8488 raw.
+        raw = _minillm_load("MiniLLM/uinst", ("valid.jsonl", "test.jsonl"))
+        if raw is None:
+            for path in (
+                "unnatural-instructions/test.jsonl",
+                "unnatural-instructions/valid.jsonl",
+            ):
+                raw = _github_jsonl_load(path)
+                if raw is not None:
+                    break
         if raw is None:
             raw = load_dataset("mrm8488/unnatural-instructions-full", split="train")
             raw = raw.shuffle(seed=seed)
@@ -869,7 +928,7 @@ class EvalInstructionDataset(Dataset):
         against the curated reference when available.
         """
         # MiniLLM publishes this as "Vicuna" (capital V).
-        raw = _minillm_load("MiniLLM/Vicuna", "test.jsonl")
+        raw = _minillm_load("MiniLLM/Vicuna", ("valid.jsonl", "test.jsonl"))
         loaded = raw is not None
         if not loaded:
             for name, config, split in [

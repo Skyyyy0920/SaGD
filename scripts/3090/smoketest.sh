@@ -16,9 +16,9 @@ python scripts/train.py \
     --method standard_kd --dataset dolly \
     --teacher_model meta-llama/Llama-3.1-8B-Instruct \
     --student_model meta-llama/Llama-3.2-1B-Instruct \
-    --load_8bit_teacher --gradient_checkpointing --use_8bit_optimizer \
+    --load_4bit_teacher --gradient_checkpointing --use_8bit_optimizer --bf16 \
     --epochs 1 --batch_size 1 --gradient_accumulation 8 \
-    --max_seq_len 256 --max_train_samples 50 --skip_eval \
+    --max_seq_len 192 --max_train_samples 50 --skip_eval \
     --output_dir /tmp/smoke_3090/ --device cuda:0
 
 echo "===== Smoke test PASSED — 3090 setup OK ====="

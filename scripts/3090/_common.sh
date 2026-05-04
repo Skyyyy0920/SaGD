@@ -25,19 +25,19 @@ BASE_TASKS="outputs_task/llama_1B"
 # load_8bit_teacher    : bitsandbytes int8 → 8B teacher fits
 # gradient_checkpointing: ~50% activation memory savings on student
 # batch=1, accum=32    : effective batch 32 (matches A100 baseline)
-THREE090_FLAGS="--load_8bit_teacher --gradient_checkpointing --use_8bit_optimizer \
+THREE090_FLAGS="--load_4bit_teacher --gradient_checkpointing --use_8bit_optimizer --bf16 \
     --batch_size 1 --gradient_accumulation 32"
 
 COMMON_DOLLY="--dataset dolly --student_model $STUDENT --teacher_model $TEACHER \
-    --epochs 10 --lr 1e-5 --max_seq_len 384 \
+    --epochs 10 --lr 1e-5 --max_seq_len 192 \
     --skip_eval --device cuda:0 $THREE090_FLAGS"
 
 COMMON_SAMSUM="--dataset samsum --student_model $STUDENT --teacher_model $TEACHER \
-    --epochs 10 --lr 1e-5 --max_seq_len 384 \
+    --epochs 10 --lr 1e-5 --max_seq_len 192 \
     --skip_eval --device cuda:0 $THREE090_FLAGS"
 
 COMMON_GSM8K="--dataset gsm8k --student_model $STUDENT --teacher_model $TEACHER \
-    --epochs 10 --lr 1e-5 --max_seq_len 384 \
+    --epochs 10 --lr 1e-5 --max_seq_len 192 \
     --skip_eval --device cuda:0 $THREE090_FLAGS"
 
 SAGD_ARGS="--teacher_saliency_path $SAL \

@@ -65,6 +65,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=2.0)
     p.add_argument("--fp16", action="store_true", default=True)
     p.add_argument("--no_fp16", action="store_true")
+    p.add_argument("--bf16", action="store_true",
+                    help="Use bfloat16 instead of fp16 for mixed-precision (more numerically stable, no GradScaler).")
 
     # SaGD-specific
     p.add_argument("--teacher_saliency_path", type=str, default=None)
@@ -100,6 +102,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--load_8bit_teacher", action="store_true",
                     help="Load teacher with bitsandbytes int8 quantization (fits 24GB GPUs).")
+    p.add_argument("--load_4bit_teacher", action="store_true",
+                    help="Load teacher with bitsandbytes NF4 4-bit quant (more aggressive than 8-bit).")
     p.add_argument("--gradient_checkpointing", action="store_true",
                     help="Enable gradient checkpointing on student to reduce activation memory.")
     p.add_argument("--use_8bit_optimizer", action="store_true",
@@ -185,6 +189,7 @@ def main() -> None:
         teacher, t_tokenizer = load_teacher(
             args.teacher_model, args.device,
             load_in_8bit=args.load_8bit_teacher,
+            load_in_4bit=args.load_4bit_teacher,
         )
 
     student, s_tokenizer = load_student(
@@ -223,7 +228,8 @@ def main() -> None:
         "warmup_ratio": args.warmup_ratio,
         "max_grad_norm": args.max_grad_norm,
         "temperature": args.temperature,
-        "fp16": args.fp16,
+        "fp16": args.fp16 and not args.bf16,
+        "bf16": args.bf16,
         "use_8bit_optimizer": args.use_8bit_optimizer,
         "log_every": args.log_every,
         "save_every_n_epochs": args.save_every_n_epochs,

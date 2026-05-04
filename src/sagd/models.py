@@ -19,17 +19,19 @@ def load_teacher(
     device: str = "cuda:0",
     dtype: torch.dtype = torch.float16,
     load_in_8bit: bool = False,
+    load_in_4bit: bool = False,
 ) -> tuple[nn.Module, PreTrainedTokenizer]:
     """Load teacher model in eval mode.
 
     Args:
         model_name: HuggingFace model name.
-        device: Target device. Ignored when ``load_in_8bit=True``
-            (handled by accelerate's device_map).
-        dtype: Model dtype (default float16). Ignored when ``load_in_8bit=True``.
-        load_in_8bit: If True, load via bitsandbytes int8 quantization to fit
-            on smaller GPUs (e.g. 24GB 3090). Linear weights stored as int8;
-            forward dequantizes per-matmul to fp16. Adds bitsandbytes dep.
+        device: Target device. Ignored when ``load_in_8bit`` or ``load_in_4bit``
+            is True (handled by accelerate's device_map).
+        dtype: Model dtype (default float16). Ignored when quantizing.
+        load_in_8bit: bitsandbytes LLM.int8(); ~50% of fp16 memory.
+        load_in_4bit: bitsandbytes NF4 quant; ~25% of fp16 memory. Cheaper
+            but higher quantization noise; use as fallback when 8-bit OOMs.
+            ``load_in_4bit`` takes precedence if both are set.
 
     Returns:
         (model, tokenizer) with model in eval mode, all params frozen.
@@ -37,7 +39,21 @@ def load_teacher(
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     _ensure_pad_token(tokenizer)
 
-    if load_in_8bit:
+    if load_in_4bit:
+        from transformers import BitsAndBytesConfig
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            device_map={"": device},
+            trust_remote_code=True,
+        )
+    elif load_in_8bit:
         from transformers import BitsAndBytesConfig
         bnb_config = BitsAndBytesConfig(load_in_8bit=True)
         model = AutoModelForCausalLM.from_pretrained(

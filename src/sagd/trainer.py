@@ -98,7 +98,10 @@ class Trainer:
         self.warmup_ratio = config.get("warmup_ratio", 0.03)
         self.max_grad_norm = config.get("max_grad_norm", 1.0)
         self.temperature = config.get("temperature", 2.0)
-        self.fp16 = config.get("fp16", True)
+        self.bf16 = config.get("bf16", False)
+        self.fp16 = config.get("fp16", True) and not self.bf16
+        # autocast dtype for amp regions: bf16 takes precedence
+        self.amp_dtype = torch.bfloat16 if self.bf16 else torch.float16
         self.use_8bit_optimizer = config.get("use_8bit_optimizer", False)
         self.log_every = config.get("log_every", 50)
         # save_every_n_epochs <= 0 means: only save the final checkpoint
@@ -415,7 +418,10 @@ class Trainer:
             end_factor=1.0, total_iters=max(warmup_steps, 1),
         )
 
+        # GradScaler is only needed for fp16 (loss scaling). bf16 has wider
+        # dynamic range and doesn't need scaling, so keep scaler disabled.
         scaler = torch.amp.GradScaler("cuda", enabled=self.fp16)
+        amp_enabled = self.fp16 or self.bf16
         stats_path = Path(save_dir) / "training_stats.jsonl"
         history: dict[str, list[float]] = {"loss": []}
         global_step = 0
@@ -469,7 +475,7 @@ class Trainer:
                         t_logits = t_out.logits.float()  # (B, L, V)
 
                 # Student forward
-                with torch.amp.autocast("cuda", enabled=self.fp16):
+                with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=amp_enabled):
                     s_out = self.student(
                         input_ids=input_ids, attention_mask=attention_mask,
                     )

@@ -25,6 +25,28 @@ from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
 
 
+def _minillm_load(repo_id: str, split_file: str = "test.jsonl"):
+    """Load a single JSONL split from a MiniLLM HF dataset, bypassing the
+    cross-split cast that ``load_dataset(repo_id, split=...)`` performs.
+
+    MiniLLM datasets (``MiniLLM/dolly``, ``MiniLLM/self-inst`` etc.) ship
+    train/valid/test JSONLs whose columns may differ across splits, which
+    causes ``DatasetGenerationCastError`` when datasets >= 3.0 tries to
+    auto-cast. Loading a single jsonl via the raw resolve URL avoids that.
+
+    Args:
+        repo_id: HF dataset repo, e.g. ``"MiniLLM/dolly"``.
+        split_file: filename within the repo, e.g. ``"test.jsonl"``.
+
+    Returns the loaded dataset, or ``None`` on any failure (caller falls back).
+    """
+    url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{split_file}"
+    try:
+        return load_dataset("json", data_files=url, split="train")
+    except Exception:
+        return None
+
+
 def _format_prompt(instruction: str, context: str) -> str:
     """Format Dolly sample into prompt string (without response)."""
     parts = ["Below is an instruction that describes a task.\n"]
@@ -87,17 +109,13 @@ class InstructionDataset(Dataset):
 
         raw = None
         # Primary source: MiniLLM-curated Dolly split (matches DA-KD / DistiLLM
-        # / MiniLLM setup). Has built-in train/valid/test splits with their own
-        # filtering and prompt re-formatting. Falls back to raw Dolly + self-
-        # split if MiniLLM dataset is unavailable.
+        # / MiniLLM setup). Loads single jsonl via URL to avoid cross-split
+        # column-cast errors. Falls back to raw Dolly + self-split below.
         if dataset_name in ("databricks/databricks-dolly-15k", "MiniLLM/dolly", None):
-            hf_split = {"train": "train", "val": "valid", "test": "test"}.get(subset)
-            for name in ["MiniLLM/dolly"]:
-                try:
-                    raw = load_dataset(name, split=hf_split, trust_remote_code=True)
-                    break
-                except Exception:
-                    continue
+            split_file = {"train": "train.jsonl", "val": "valid.jsonl",
+                           "test": "test.jsonl"}.get(subset)
+            if split_file is not None:
+                raw = _minillm_load("MiniLLM/dolly", split_file)
 
         if raw is None:
             # Fallback: self-split from raw Dolly
@@ -678,13 +696,7 @@ class EvalInstructionDataset(Dataset):
         """Dolly eval — prefer MiniLLM curated 500-sample test split (matches
         DA-KD / DistiLLM / MiniLLM setup). Fallback: self-split last 500 of
         raw Dolly-15K."""
-        raw = None
-        for name in ["MiniLLM/dolly"]:
-            try:
-                raw = load_dataset(name, split="test", trust_remote_code=True)
-                break
-            except Exception:
-                continue
+        raw = _minillm_load("MiniLLM/dolly", "test.jsonl")
         if raw is None:
             raw = load_dataset("databricks/databricks-dolly-15k", split="train")
             raw = raw.shuffle(seed=seed)
@@ -706,14 +718,7 @@ class EvalInstructionDataset(Dataset):
         Primary: ``MiniLLM/self-inst`` (curated 252-sample test split).
         Fallback: ``yizhongw/self_instruct`` human_eval / self_instruct config.
         """
-        raw = None
-        # MiniLLM curated split first
-        for name in ["MiniLLM/self-inst", "MiniLLM/self_inst"]:
-            try:
-                raw = load_dataset(name, split="test", trust_remote_code=True)
-                break
-            except Exception:
-                continue
+        raw = _minillm_load("MiniLLM/self-inst", "test.jsonl")
         # Fallback: original yizhongw repo
         if raw is None:
             for name, config in [
@@ -762,17 +767,9 @@ class EvalInstructionDataset(Dataset):
         Fallback: ``Muennighoff/natural-instructions`` raw, with our own
         soft length filter (>= 11 tokens) applied at the reference text.
         """
-        raw = None
-        # 1) MiniLLM curated (already filtered)
-        for name in [
-            "MiniLLM/super-natural-instructions",
-            "MiniLLM/super_natural_instructions",
-        ]:
-            try:
-                raw = load_dataset(name, split="test", trust_remote_code=True)
-                break
-            except Exception:
-                continue
+        # 1) MiniLLM curated (already filtered to len>=11)
+        # MiniLLM names this dataset "sinst" (Super-Natural Instructions abbrev).
+        raw = _minillm_load("MiniLLM/sinst", "test.jsonl")
 
         if raw is not None:
             limit = max_samples if max_samples is not None else 500
@@ -832,17 +829,8 @@ class EvalInstructionDataset(Dataset):
         drawn from the core set (matches DA-KD / DistiLLM / MiniLLM setup).
         Fallback: ``mrm8488/unnatural-instructions-full`` raw.
         """
-        raw = None
-        for name in [
-            "MiniLLM/unnatural-instructions",
-            "MiniLLM/unnatural_instructions",
-        ]:
-            try:
-                raw = load_dataset(name, split="test", trust_remote_code=True)
-                break
-            except Exception:
-                continue
-
+        # MiniLLM names this dataset "uinst" (Unnatural Instructions abbrev).
+        raw = _minillm_load("MiniLLM/uinst", "test.jsonl")
         if raw is None:
             raw = load_dataset("mrm8488/unnatural-instructions-full", split="train")
             raw = raw.shuffle(seed=seed)
@@ -880,25 +868,23 @@ class EvalInstructionDataset(Dataset):
         fail. The original VicunaEval metric is GPT-as-Judge; we report ROUGE-L
         against the curated reference when available.
         """
-        loaded = False
-        candidates = [
-            ("MiniLLM/vicuna-eval", None, "test"),
-            ("MiniLLM/vicuna_eval", None, "test"),
-            ("MiniLLM/vicuna-eval-80", None, "test"),
-            ("lmsys/vicuna_eval", None, "train"),
-            ("MBZUAI/vicuna-eval", None, "train"),
-        ]
-        raw = None
-        for name, config, split in candidates:
-            try:
-                if config is not None:
-                    raw = load_dataset(name, config, split=split, trust_remote_code=True)
-                else:
-                    raw = load_dataset(name, split=split, trust_remote_code=True)
-                loaded = True
-                break
-            except Exception:
-                continue
+        # MiniLLM publishes this as "Vicuna" (capital V).
+        raw = _minillm_load("MiniLLM/Vicuna", "test.jsonl")
+        loaded = raw is not None
+        if not loaded:
+            for name, config, split in [
+                ("lmsys/vicuna_eval", None, "train"),
+                ("MBZUAI/vicuna-eval", None, "train"),
+            ]:
+                try:
+                    if config is not None:
+                        raw = load_dataset(name, config, split=split, trust_remote_code=True)
+                    else:
+                        raw = load_dataset(name, split=split, trust_remote_code=True)
+                    loaded = True
+                    break
+                except Exception:
+                    continue
 
         if not loaded or raw is None:
             print("WARNING: Could not load Vicuna-Eval from any known source. Skipping.")

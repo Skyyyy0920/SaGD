@@ -25,10 +25,10 @@ from sagd.data import EvalInstructionDataset
 from sagd.evaluation import compute_rouge, generate_responses
 from sagd.models import load_student
 
-# Benchmarks for DA-KD-style evaluation.
-# self_inst removed: yizhongw/self_instruct loading script deprecated on HF.
-# vicuna_eval removed: no reliable HF source; requires GPT-4 judging, not ROUGE-L.
-BENCHMARKS = ["dolly_eval", "super_natural", "unnatural"]
+# Benchmarks for DA-KD-style evaluation (full 5-benchmark set per DA-KD Table 1).
+# self_inst and vicuna_eval can fail to load (HF dataset issues) — handled
+# gracefully per-benchmark in the eval loop (try/except).
+BENCHMARKS = ["dolly_eval", "self_inst", "super_natural", "unnatural", "vicuna_eval"]
 
 
 def parse_args() -> argparse.Namespace:

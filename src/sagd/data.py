@@ -778,6 +778,59 @@ class EvalInstructionDataset(Dataset):
                 tokenizer, inst, inp, out, max_seq_len, i,
             ))
 
+    def _load_vicuna_eval(self, tokenizer, max_seq_len, max_samples, seed):
+        """Vicuna-Eval 80-question benchmark (used by DA-KD, MiniLLM).
+
+        Tries multiple HF sources; falls back to empty (with warning) if all
+        fail. The original VicunaEval metric is GPT-as-Judge; we report ROUGE-L
+        against the curated reference when available.
+        """
+        loaded = False
+        candidates = [
+            ("MiniLLM/vicuna-eval-80", None, "test"),
+            ("MiniLLM/vicuna-eval", None, "test"),
+            ("lmsys/vicuna_eval", None, "train"),
+            ("MBZUAI/vicuna-eval", None, "train"),
+        ]
+        raw = None
+        for name, config, split in candidates:
+            try:
+                if config is not None:
+                    raw = load_dataset(name, config, split=split, trust_remote_code=True)
+                else:
+                    raw = load_dataset(name, split=split, trust_remote_code=True)
+                loaded = True
+                break
+            except Exception:
+                continue
+
+        if not loaded or raw is None:
+            print("WARNING: Could not load Vicuna-Eval from any known source. Skipping.")
+            return
+
+        raw = raw.shuffle(seed=seed)
+        limit = max_samples if max_samples is not None else 80
+        raw = raw.select(range(min(limit, len(raw))))
+        for i, row in enumerate(raw):
+            instruction = (
+                row.get("question")
+                or row.get("instruction")
+                or row.get("prompt")
+                or row.get("text")
+                or ""
+            )
+            inp = row.get("input", "") or ""
+            out = (
+                row.get("response")
+                or row.get("answer")
+                or row.get("output")
+                or row.get("completion")
+                or ""
+            )
+            self.samples.append(self._tokenize_sample(
+                tokenizer, instruction, inp, out, max_seq_len, i,
+            ))
+
     def __len__(self) -> int:
         return len(self.samples)
 

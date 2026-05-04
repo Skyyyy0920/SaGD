@@ -98,6 +98,10 @@ def parse_args() -> argparse.Namespace:
     # Output
     p.add_argument("--output_dir", type=str, default="outputs/")
     p.add_argument("--device", type=str, default="cuda:0")
+    p.add_argument("--load_8bit_teacher", action="store_true",
+                    help="Load teacher with bitsandbytes int8 quantization (fits 24GB GPUs).")
+    p.add_argument("--gradient_checkpointing", action="store_true",
+                    help="Enable gradient checkpointing on student to reduce activation memory.")
     p.add_argument("--skip_eval", action="store_true")
     p.add_argument("--skip_bertscore", action="store_true",
                     help="Skip BERTScore in post-training eval")
@@ -176,9 +180,15 @@ def main() -> None:
     if args.method == "sft":
         teacher, t_tokenizer = None, None
     else:
-        teacher, t_tokenizer = load_teacher(args.teacher_model, args.device)
+        teacher, t_tokenizer = load_teacher(
+            args.teacher_model, args.device,
+            load_in_8bit=args.load_8bit_teacher,
+        )
 
-    student, s_tokenizer = load_student(args.student_model, args.device)
+    student, s_tokenizer = load_student(
+        args.student_model, args.device,
+        gradient_checkpointing=args.gradient_checkpointing,
+    )
 
     # Use student tokenizer for data
     dataset = create_dataset(args, s_tokenizer, subset="train")

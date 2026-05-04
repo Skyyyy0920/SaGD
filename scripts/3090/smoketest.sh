@@ -7,6 +7,7 @@
 set -e
 cd "$(dirname "$0")/../.."
 export PYTHONPATH="$(pwd)/src:$PYTHONPATH"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 echo "===== 3090 smoke test (LLaMA 3.1-8B int8 + 3.2-1B fp32 student) ====="
 nvidia-smi --query-gpu=name,memory.free,memory.total --format=csv

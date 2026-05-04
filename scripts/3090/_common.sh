@@ -3,6 +3,10 @@
 # Source from each per-GPU script:
 #     source "$(dirname "$0")/_common.sh"
 
+# Defragment-friendly allocator — recovers 1-3 GB of "reserved but unallocated"
+# memory that would otherwise cause OOM at backward time on tight 24GB GPUs.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 # ----- Models -----
 TEACHER="meta-llama/Llama-3.1-8B-Instruct"
 STUDENT="meta-llama/Llama-3.2-1B-Instruct"

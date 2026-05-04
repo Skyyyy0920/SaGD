@@ -29,15 +29,15 @@ THREE090_FLAGS="--load_8bit_teacher --gradient_checkpointing --use_8bit_optimize
     --batch_size 1 --gradient_accumulation 32"
 
 COMMON_DOLLY="--dataset dolly --student_model $STUDENT --teacher_model $TEACHER \
-    --epochs 10 --lr 1e-5 --max_seq_len 512 \
+    --epochs 10 --lr 1e-5 --max_seq_len 384 \
     --skip_eval --device cuda:0 $THREE090_FLAGS"
 
 COMMON_SAMSUM="--dataset samsum --student_model $STUDENT --teacher_model $TEACHER \
-    --epochs 10 --lr 1e-5 --max_seq_len 512 \
+    --epochs 10 --lr 1e-5 --max_seq_len 384 \
     --skip_eval --device cuda:0 $THREE090_FLAGS"
 
 COMMON_GSM8K="--dataset gsm8k --student_model $STUDENT --teacher_model $TEACHER \
-    --epochs 10 --lr 1e-5 --max_seq_len 512 \
+    --epochs 10 --lr 1e-5 --max_seq_len 384 \
     --skip_eval --device cuda:0 $THREE090_FLAGS"
 
 SAGD_ARGS="--teacher_saliency_path $SAL \

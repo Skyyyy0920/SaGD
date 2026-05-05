@@ -52,7 +52,11 @@ SAGD_ARGS="--teacher_saliency_path $SAL \
 # ---------- Build task list ----------
 declare -a TASKS
 
-SEEDS_BL="42 123 456"
+# Default: 1 seed (42) for fast first-pass results (~10h for 15 tasks
+# on 3 parallel A100 workers).
+# To run all 3 seeds, override via env var:
+#     LLAMA_SEEDS="42 123 456" bash scripts/a100_llama_train.sh
+SEEDS_BL="${LLAMA_SEEDS:-42}"
 for SEED in $SEEDS_BL; do
     # Baselines (7 non-SaGD methods)
     for METHOD in sft standard_kd reverse_kl seqkd gkd distillm dakd; do

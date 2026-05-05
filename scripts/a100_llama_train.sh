@@ -40,9 +40,12 @@ SAL="data/teacher_saliency_dolly_llama.pt"
 GRAD_ORDER="outputs_ours/curriculum/llama_1B/dolly/gradient_order.pt"
 POCL_ORDER="outputs_ours/curriculum/llama_1B/dolly/pocl_order.pt"
 
-# A100 fp16 teacher fits easily; 8 bs * 4 grad-accum = 32 effective batch.
+# A100 fp16 teacher fits easily.
+# batch_size 4 * grad_accum 8 = 32 effective batch (unchanged from before),
+# but per-step activation memory halved — lets 2 training tasks coexist on
+# a single 80GB A100 (~30GB/task with batch=4 vs ~36GB/task with batch=8).
 COMMON="--dataset dolly --student_model $STUDENT --teacher_model $TEACHER \
-    --epochs 10 --batch_size 8 --gradient_accumulation 4 \
+    --epochs 10 --batch_size 4 --gradient_accumulation 8 \
     --lr 1e-5 --max_seq_len 512 --skip_eval --device cuda:0"
 
 SAGD_ARGS="--teacher_saliency_path $SAL \

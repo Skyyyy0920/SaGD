@@ -1,10 +1,11 @@
 #!/bin/bash
-# LLaMA: Teacher saliency + gradient profiling (GPU 0)
-# Run this FIRST. Takes ~2h.
+# LLaMA: Teacher saliency + gradient profiling.
+# Run this FIRST. Takes ~2h on a single A100.
+# Pin GPU via CUDA_VISIBLE_DEVICES, e.g.:
+#     CUDA_VISIBLE_DEVICES=3 bash scripts/llama_prereq.sh
 set -e
 cd "$(dirname "$0")/.."
 export PYTHONPATH="$(pwd)/src:$PYTHONPATH"
-export CUDA_VISIBLE_DEVICES=0
 
 TEACHER="meta-llama/Llama-3.1-8B-Instruct"
 STUDENT="meta-llama/Llama-3.2-1B-Instruct"
